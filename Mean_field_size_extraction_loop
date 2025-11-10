@@ -5,7 +5,7 @@ library(dplyr)
 set.seed(42)  # reproducible clustering
 dir.create("converted", showWarnings = FALSE, recursive = TRUE)
 
-# INPUT: your big layer (shp or gpkg)
+# INPUT: (shp or gpkg)
 big_path <- "COV_ALL_NO_COTAHUASI.shp"  # change if needed
 target_batches <- 80
 epsg <- 32718  # WGS84 / UTM 18S
@@ -27,7 +27,7 @@ xy  <- st_coordinates(pts)
 km <- kmeans(xy, centers = target_batches, iter.max = 200, nstart = 10)
 big_utm$batch_id <- km$cluster
 
-# 4) Make nice two-digit codes and write outputs
+# 4) two-digit codes and write outputs
 big_utm$batch_code <- sprintf("%02d", as.integer(factor(big_utm$batch_id)))
 
 # Manifest (ID -> batch_code)
@@ -43,15 +43,6 @@ for (b in sort(unique(big_utm$batch_code))) {
   st_write(out, paste0("converted/grid_batch_", b, "_utm.gpkg"),
            delete_dsn = TRUE, quiet = TRUE)
 }
-
-message("✅ Wrote ", length(unique(big_utm$batch_code)),
-        " batches to /converted (UTM 18S) + batch_manifest.csv")
-
-
-
-
-
-
 
 
 
