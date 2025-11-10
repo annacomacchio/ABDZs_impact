@@ -1,0 +1,334 @@
+# =====================================================================
+# Script name: analysis_mfs_mean_field_size.R
+# Project:     ABDZs_impact
+#
+# Purpose:
+#   Assess effects of ABDZs on mean field size (MFS) using matched data:
+#     - Input: matched_mahalanobis_MFS_4km.csv (4-km grid, Mahalanobis match)
+#     - Outcome: delta_mean_patch_size
+#         = mean_patch_size_ha_2022 - mean_patch_size_ha_2000
+#           (fallback: 2020 - 2000 if 2022 not available)
+#     - OLS with matching covariates (classical SEs only)
+#     - Sensemakr sensitivity for TREATMENT
+#     - Figure:
+#         (a) ΔMFS by group (Treatment vs Control, CI, stars)
+#         (b) MFS by group & year
+#
+# Input:
+#   - matched_mahalanobis_MFS_4km.csv
+# =====================================================================
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(scales)
+  library(marginaleffects)
+  library(sensemakr)
+  library(patchwork)
+  library(forcats)
+})
+
+set.seed(42)
+
+# ---------------------------------------------------------------------
+# 1) Load data
+# ---------------------------------------------------------------------
+infile <- "matched_mahalanobis_MFS_4km.csv"
+stopifnot(file.exists(infile))
+
+dat <- read.csv(infile, check.names = FALSE)
+
+# Ensure ID exists
+if (!"ID" %in% names(dat)) {
+  dat$ID <- seq_len(nrow(dat))
+}
+
+# ---------------------------------------------------------------------
+# 2) Treatment coding (0/1 -> Control/ABDZ)
+# ---------------------------------------------------------------------
+if (!"TREATMENT" %in% names(dat)) {
+  stop("TREATMENT column not found in input.")
+}
+
+to_int01 <- function(x){
+  if (is.factor(x)) x <- as.character(x)
+  if (is.character(x)) {
+    xl <- tolower(trimws(x))
+    x <- ifelse(
+      xl %in% c("1","true","t","yes","y","abdz","treated","treatment"), 1L,
+      ifelse(xl %in% c("0","false","f","no","n","control"), 0L, NA_integer_)
+    )
+  }
+  if (is.logical(x)) x <- as.integer(x)
+  if (is.numeric(x)) x <- ifelse(!is.na(x) & x != 0, 1L, 0L)
+  as.integer(x)
+}
+
+dat$TREATMENT <- to_int01(dat$TREATMENT)
+
+if (any(!dat$TREATMENT %in% c(0L, 1L), na.rm = TRUE)) {
+  stop("Non-binary values in TREATMENT after recoding.")
+}
+
+dat$TREATMENT <- factor(dat$TREATMENT,
+                        levels = c(0, 1),
+                        labels = c("Control", "ABDZ"))
+
+# ---------------------------------------------------------------------
+# 3) Construct delta_mean_patch_size
+# ---------------------------------------------------------------------
+if (!"delta_mean_patch_size" %in% names(dat)) {
+  has_2022 <- all(c("mean_patch_size_ha_2000", "mean_patch_size_ha_2022") %in% names(dat))
+  has_2020 <- all(c("mean_patch_size_ha_2000", "mean_patch_size_ha_2020") %in% names(dat))
+
+  if (has_2022) {
+    dat <- dat %>%
+      mutate(delta_mean_patch_size = mean_patch_size_ha_2022 - mean_patch_size_ha_2000)
+    post_col    <- "mean_patch_size_ha_2022"
+    post_lbl    <- "2022"
+    post_pretty <- "2020–22"
+  } else if (has_2020) {
+    dat <- dat %>%
+      mutate(delta_mean_patch_size = mean_patch_size_ha_2020 - mean_patch_size_ha_2000)
+    post_col    <- "mean_patch_size_ha_2020"
+    post_lbl    <- "2020"
+    post_pretty <- "2000–20"
+  } else {
+    stop("Cannot create delta_mean_patch_size: need mean_patch_size_ha_2022 or _2020.")
+  }
+} else {
+  if ("mean_patch_size_ha_2022" %in% names(dat)) {
+    post_col    <- "mean_patch_size_ha_2022"
+    post_lbl    <- "2022"
+    post_pretty <- "2020–22"
+  } else if ("mean_patch_size_ha_2020" %in% names(dat)) {
+    post_col    <- "mean_patch_size_ha_2020"
+    post_lbl    <- "2020"
+    post_pretty <- "2000–20"
+  } else {
+    post_col    <- NA_character_
+    post_lbl    <- "Post"
+    post_pretty <- "Post"
+  }
+}
+
+stopifnot("delta_mean_patch_size" %in% names(dat))
+
+# ---------------------------------------------------------------------
+# 4) Summary statistics
+# ---------------------------------------------------------------------
+summary_stats <- dat %>%
+  group_by(TREATMENT) %>%
+  summarise(
+    n          = n(),
+    mean_2000  = mean(mean_patch_size_ha_2000, na.rm = TRUE),
+    mean_post  = if (!is.na(post_col) && post_col %in% names(.))
+                   mean(.data[[post_col]], na.rm = TRUE) else NA_real_,
+    mean_delta = mean(delta_mean_patch_size, na.rm = TRUE),
+    .groups    = "drop"
+  )
+
+cat("
+Summary statistics by group (MFS, 4-km, Mahalanobis):
+")
+print(summary_stats)
+
+# ---------------------------------------------------------------------
+# 5) OLS: ΔMFS ~ TREATMENT + covariates (classical SEs)
+# ---------------------------------------------------------------------
+covariates <- c(
+  "precipitation","temperature","population_density",
+  "elevation","slope","distance_to_road",
+  "accessibility","income","crop_2000s",
+  "mean_patch_size_ha_2000"
+)
+covariates_present <- intersect(covariates, names(dat))
+if (!length(covariates_present)) {
+  stop("No expected covariates present in matched dataset.")
+}
+
+ols_data <- dat %>%
+  filter(
+    is.finite(delta_mean_patch_size),
+    if_all(all_of(covariates_present), ~ is.finite(.))
+  )
+
+stopifnot(nrow(ols_data) > 0)
+
+formula_base <- as.formula(
+  paste(
+    "delta_mean_patch_size ~ TREATMENT +",
+    paste(covariates_present, collapse = " + ")
+  )
+)
+
+model_ols <- lm(formula_base, data = ols_data)
+
+cat("
+OLS (ΔMFS ~ TREATMENT + covariates):
+")
+print(summary(model_ols))
+
+# ATE via marginaleffects (default covariance)
+cat("
+ATE (ΔMFS) via avg_comparisons (classical SEs):
+")
+ate_res <- avg_comparisons(
+  model_ols,
+  variables = "TREATMENT"
+)
+print(ate_res)
+
+# ---------------------------------------------------------------------
+# 6) Sensemakr sensitivity for TREATMENT (ABDZ)
+# ---------------------------------------------------------------------
+cat("
+Sensemakr sensitivity for TREATMENT (ABDZ):
+")
+
+smkr <- sensemakr(
+  model                = model_ols,
+  treatment            = "TREATMENTABDZ",
+  benchmark_covariates = covariates_present,
+  q                    = 1,
+  alpha                = 0.05
+)
+print(summary(smkr))
+# plot(smkr) # optional
+
+# =====================================================================
+# 7) Two-panel figure: ΔMFS + levels by year
+# =====================================================================
+
+plot_dat <- dat %>%
+  mutate(
+    Group = fct_recode(
+      TREATMENT,
+      "Treatment" = "ABDZ",
+      "Control"   = "Control"
+    )
+  )
+
+treat_cols <- c("Control" = "grey70", "Treatment" = "#2ca25f")
+
+# ---- Top: Δ mean field size by group ----
+sum_delta <- plot_dat %>%
+  group_by(Group) %>%
+  summarise(
+    n    = sum(!is.na(delta_mean_patch_size)),
+    mean = mean(delta_mean_patch_size, na.rm = TRUE),
+    sd   = sd(delta_mean_patch_size,   na.rm = TRUE),
+    se   = ifelse(n > 0, sd / sqrt(n), NA_real_),
+    lwr  = mean + qt(0.025, df = pmax(n - 1, 1)) * se,
+    upr  = mean + qt(0.975, df = pmax(n - 1, 1)) * se,
+    .groups = "drop"
+  )
+
+# Significance from classical OLS
+sm <- summary(model_ols)
+if (!"TREATMENTABDZ" %in% rownames(sm$coefficients)) {
+  stop("TREATMENTABDZ coefficient not found in OLS output. Check factor coding.")
+}
+pval_m <- sm$coefficients["TREATMENTABDZ", "Pr(>|t|)"]
+
+sig_lab <- dplyr::case_when(
+  is.finite(pval_m) & pval_m < 0.001 ~ "***",
+  is.finite(pval_m) & pval_m < 0.01  ~ "**",
+  is.finite(pval_m) & pval_m < 0.05  ~ "*",
+  is.finite(pval_m) & pval_m < 0.10  ~ "·",
+  TRUE                               ~ "n.s."
+)
+
+# Headroom for bracket + stars
+y_max <- max(sum_delta$upr, na.rm = TRUE)
+y_min <- min(0, min(sum_delta$lwr, na.rm = TRUE))
+y_rng <- ifelse(is.finite(y_max - y_min) && (y_max - y_min) > 0,
+                y_max - y_min, 0.05)
+
+seg_y <- y_max + 0.55 * 0.20 * y_rng
+txt_y <- y_max + 0.85 * 0.20 * y_rng
+
+p_top <- ggplot(sum_delta, aes(x = Group, y = mean, fill = Group)) +
+  geom_col(width = 0.7) +
+  geom_errorbar(aes(ymin = lwr, ymax = upr),
+                width = 0.15, linewidth = 0.6) +
+  scale_fill_manual(values = treat_cols) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  annotate("segment", x = 1, xend = 2, y = seg_y, yend = seg_y) +
+  annotate("text", x = 1.5, y = txt_y, label = sig_lab, size = 5) +
+  labs(
+    title = "a) Change in mean field size",
+    x     = "Treatment",
+    y     = expression(Delta~"Mean field size (ha)")
+  ) +
+  coord_cartesian(ylim = c(y_min, y_max + 0.20 * y_rng), clip = "off") +
+  guides(fill = "none") +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.margin      = margin(t = 10, r = 10, b = 5, l = 10)
+  )
+
+# ---- Bottom: Mean field size by group & year ----
+if (!is.na(post_col) && all(c("mean_patch_size_ha_2000", post_col) %in% names(plot_dat))) {
+  levels_long <- plot_dat %>%
+    select(Group,
+           `2000` = mean_patch_size_ha_2000,
+           !!post_lbl := all_of(post_col)) %>%
+    pivot_longer(
+      cols      = c(`2000`, all_of(post_lbl)),
+      names_to  = "Year",
+      values_to = "mfs"
+    ) %>%
+    mutate(
+      Year = factor(
+        Year,
+        levels = c("2000", post_lbl),
+        labels = c("2000–02", post_pretty)
+      )
+    )
+
+  sum_levels <- levels_long %>%
+    group_by(Year, Group) %>%
+    summarise(
+      n    = sum(!is.na(mfs)),
+      mean = mean(mfs, na.rm = TRUE),
+      sd   = sd(mfs,   na.rm = TRUE),
+      se   = ifelse(n > 0, sd / sqrt(n), NA_real_),
+      lwr  = mean + qt(0.025, df = pmax(n - 1, 1)) * se,
+      upr  = mean + qt(0.975, df = pmax(n - 1, 1)) * se,
+      .groups = "drop"
+    )
+
+  p_bottom <- ggplot(sum_levels, aes(x = Year, y = mean, fill = Group)) +
+    geom_col(position = position_dodge(width = 0.7), width = 0.6) +
+    geom_errorbar(
+      aes(ymin = lwr, ymax = upr),
+      position = position_dodge(width = 0.7),
+      width    = 0.15, linewidth = 0.6
+    ) +
+    scale_fill_manual(values = treat_cols) +
+    labs(
+      title = "b) Mean field size by group and year",
+      x     = "Year",
+      y     = "Mean field size (ha)"
+    ) +
+    guides(fill = "none") +
+    theme_minimal(base_size = 13) +
+    theme(panel.grid.minor = element_blank())
+} else {
+  p_bottom <- ggplot() +
+    annotate("text", x = 0.5, y = 0.5,
+             label = "Post-treatment MFS columns not available.",
+             size = 5) +
+    theme_void()
+}
+
+# ---- Combine panels ----
+p_combo <- p_top | p_bottom
+print(p_combo)
+
+cat("
+✅ MFS analysis (4-km Mahalanobis sample) completed
+")
