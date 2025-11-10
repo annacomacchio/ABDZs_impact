@@ -7,7 +7,7 @@
 #     - Uses matched ABDZ vs control sample: GPP_CV_matched_CAL.shp
 #     - Computes summary statistics by treatment group
 #     - Fits OLS for delta_cv with covariate controls (no baseline GPP CV)
-#     - Uses ONLY 5 km grid cluster-robust (HC1) standard errors:
+#     - Uses ONLY 5 km grid cluster-robust (HC1) standard errors: 
 #         * For coefficient inference
 #         * For ATT via marginaleffects
 #         * For Sensemakr sensitivity analysis
