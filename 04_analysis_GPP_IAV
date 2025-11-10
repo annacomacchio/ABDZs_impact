@@ -1,0 +1,332 @@
+# =========================================================
+# Script name: analysis_gpp_cv.R
+# Project:     ABDZs_impact
+#
+# Purpose:
+#   Analysis of change in interannual variability of GPP (ΔCV):
+#     - Uses matched ABDZ vs control sample: GPP_CV_matched_CAL.shp
+#     - Computes summary statistics by treatment group
+#     - Fits OLS for delta_cv with covariate controls (no baseline GPP CV)
+#     - Uses ONLY 5 km grid cluster-robust (HC1) standard errors:
+#         * For coefficient inference
+#         * For ATT via marginaleffects
+#         * For Sensemakr sensitivity analysis
+#     - Produces a barplot of mean ΔCV with 95% CI + significance stars
+#       based on 5 km clustered SEs.
+#
+# Input:
+#   - GPP_exports/GPP_CV_matched_CAL.shp
+#
+# Output (printed/plots in R session):
+#   - Grouped summary stats for cv_p1, cv_p2, delta_cv
+#   - OLS table with 5 km clustered SEs
+#   - Barplot for mean delta_cv (Treatment vs Control) + stars
+#   - ATT estimates (cluster-robust)
+#   - Sensemakr summaries (optional)
+# =========================================================
+
+suppressPackageStartupMessages({
+  library(sf)
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(ggplot2)
+  library(lmtest)
+  library(sandwich)
+  library(gstat)
+  library(sp)
+  library(marginaleffects)
+  library(sensemakr)
+})
+
+set.seed(42)
+
+# -----------------------------
+# 0) Load matched CAL shapefile
+# -----------------------------
+shp_path <- "GPP_exports/GPP_CV_matched_CAL.shp"
+stopifnot(file.exists(shp_path))
+
+sf_cal <- sf::st_read(shp_path, quiet = TRUE)
+
+# -----------------------------
+# 1) Rename truncated fields to standard names
+# -----------------------------
+rename_if_present <- function(df, from, to) {
+  if (from %in% names(df)) {
+    names(df)[names(df) == from] <- to
+  }
+  df
+}
+
+sf_cal <- sf_cal |>
+  rename_if_present("TREATME", "TREATMENT") |>
+  rename_if_present("accssbl", "accessibility") |>
+  rename_if_present("elevatn", "elevation") |>
+  rename_if_present("prcpttn", "precipitation") |>
+  rename_if_present("temprtr", "temperature") |>
+  rename_if_present("dstnc__", "distance_to_road") |>
+  rename_if_present("Ag_2000", "Agriculture_2000") |>
+  rename_if_present("ppltn_d", "population_density") |>
+  rename_if_present("delt_cv", "delta_cv") |>
+  rename_if_present("delt_sd", "delta_sd")
+
+# -----------------------------
+# 2) Coerce treatment to 0/1
+# -----------------------------
+to_int01 <- function(x){
+  if (is.factor(x)) x <- as.character(x)
+  if (is.character(x)) {
+    xl <- tolower(trimws(x))
+    x <- ifelse(
+      xl %in% c("1","true","t","yes","y","treated","treatment"), 1L,
+      ifelse(
+        xl %in% c("0","false","f","no","n","control"), 0L,
+        NA_integer_
+      )
+    )
+  }
+  if (is.logical(x)) x <- as.integer(x)
+  if (is.numeric(x)) x <- as.integer(x != 0 & !is.na(x))
+  as.integer(x)
+}
+
+stopifnot("TREATMENT" %in% names(sf_cal))
+sf_cal$TREATMENT <- to_int01(sf_cal$TREATMENT)
+
+# -----------------------------
+# 3) Ensure delta_cv outcome exists
+# -----------------------------
+if (!("delta_cv" %in% names(sf_cal)) &&
+    all(c("cv_p1","cv_p2") %in% names(sf_cal))) {
+  sf_cal <- sf_cal %>%
+    dplyr::mutate(delta_cv = cv_p2 - cv_p1)
+}
+
+if (!"delta_cv" %in% names(sf_cal)) {
+  stop("delta_cv is not available and cannot be constructed.")
+}
+
+# =========================
+# A) Summary stats (CV)
+# =========================
+metrics <- c("cv_p1","cv_p2","delta_cv")
+metrics <- intersect(metrics, names(sf_cal))
+
+summ_by_group <- sf_cal %>%
+  sf::st_drop_geometry() %>%
+  dplyr::group_by(TREATMENT) %>%
+  dplyr::summarise(
+    dplyr::across(
+      dplyr::all_of(metrics),
+      list(
+        mean = ~mean(., na.rm = TRUE),
+        sd   = ~sd(.,   na.rm = TRUE),
+        n    = ~sum(is.finite(.))
+      ),
+      .names = "{.col}_{.fn}"
+    ),
+    .groups = "drop"
+  )
+
+cat("\n=== Summary statistics by treatment group ===\n")
+print(summ_by_group)
+
+# =========================
+# B) Group means of delta_cv (unweighted) with 95% CI
+# =========================
+df_all <- sf_cal %>% sf::st_drop_geometry()
+
+plot_df <- df_all %>%
+  dplyr::filter(is.finite(delta_cv)) %>%
+  dplyr::group_by(TREATMENT) %>%
+  dplyr::summarise(
+    mean = mean(delta_cv, na.rm = TRUE),
+    sd   = sd(delta_cv,   na.rm = TRUE),
+    n    = dplyr::n(),
+    se   = sd / sqrt(pmax(n, 1)),
+    tcrit= qt(0.975, df = pmax(n - 1, 1)),
+    lo   = mean - tcrit * se,
+    hi   = mean + tcrit * se,
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    group = factor(
+      ifelse(TREATMENT == 1L, "Treatment", "Control"),
+      levels = c("Control", "Treatment")
+    )
+  )
+
+# =========================
+# C) OLS for delta_cv with covariates
+#     + 5 km clustered robust SEs (ONLY)
+# =========================
+
+# Covariates (no baseline GPP CV)
+covariates <- c(
+  "precipitation","temperature","population_density","elevation",
+  "slope","distance_to_road","accessibility","Agriculture_2000","INCOME"
+)
+covariates_present <- intersect(covariates, names(df_all))
+
+if (length(covariates_present) == 0L) {
+  stop("No covariates from the expected set are present in the data.")
+}
+
+# Build clean analysis dataset
+df_ols <- df_all %>%
+  dplyr::mutate(
+    TREATMENT = as.integer(TREATMENT),
+    dplyr::across(
+      dplyr::all_of(c("delta_cv", covariates_present)),
+      ~ suppressWarnings(as.numeric(.))
+    )
+  ) %>%
+  dplyr::filter(
+    TREATMENT %in% c(0L, 1L),
+    is.finite(delta_cv),
+    dplyr::if_all(
+      dplyr::all_of(covariates_present),
+      ~ is.finite(.) & !is.na(.)
+    )
+  )
+
+if (nrow(df_ols) == 0L) {
+  stop("No observations left after cleaning for OLS.")
+}
+
+# Construct 5 km spatial clusters based on centroids
+if (!"ID" %in% names(sf_cal)) {
+  sf_cal$ID <- seq_len(nrow(sf_cal))
+}
+
+sf_use <- sf_cal[match(df_ols$ID, sf_cal$ID), ]
+
+crs_obj <- sf::st_crs(sf_use)
+if (isTRUE(crs_obj$IsGeographic) || is.na(crs_obj)) {
+  message("Reprojecting to UTM (EPSG:32718 assumed) for 5 km clusters...")
+  sf_use <- sf::st_transform(sf_use, 32718)
+}
+
+centroids <- sf::st_centroid(sf_use)
+coords    <- sf::st_coordinates(centroids)
+
+sf_use <- sf_use %>%
+  dplyr::mutate(
+    cell_x     = floor(coords[,1] / 5000),
+    cell_y     = floor(coords[,2] / 5000),
+    cluster_id = paste0(cell_x, "_", cell_y)
+  )
+
+df_ols$cluster_id <- sf_use$cluster_id
+
+cat("\nNumber of 5 km clusters: ",
+    length(unique(df_ols$cluster_id)), "\n")
+
+# Fit OLS model
+rhs <- paste(c("TREATMENT", covariates_present), collapse = " + ")
+form_cv <- stats::as.formula(paste("delta_cv ~", rhs))
+
+mod_cv <- lm(form_cv, data = df_ols)
+
+# 5 km cluster-robust covariance matrix (HC1)
+Vcov_cluster <- sandwich::vcovCL(
+  mod_cv,
+  cluster = df_ols$cluster_id,
+  type    = "HC1"
+)
+
+cat("\n=== OLS for delta_cv with 5 km CLUSTER-robust SEs ===\n")
+ct_cluster <- lmtest::coeftest(mod_cv, vcov. = Vcov_cluster)
+print(ct_cluster)
+
+# Extract p-value for TREATMENT from clustered SEs
+if (!"TREATMENT" %in% rownames(ct_cluster)) {
+  stop("TREATMENT coefficient not found in OLS results.")
+}
+pval_treat <- unname(ct_cluster["TREATMENT", "Pr(>|t|)"])
+
+get_stars <- function(p) {
+  if (is.na(p))        return("n.s.")
+  if (p < 0.001)       return("***")
+  if (p < 0.01)        return("**")
+  if (p < 0.05)        return("*")
+  if (p < 0.10)        return("·")
+  "n.s."
+}
+stars <- get_stars(pval_treat)
+
+# =========================
+# D) Barplot with significance stars (5 km cluster-based)
+# =========================
+y_lower   <- min(plot_df$lo, na.rm = TRUE)
+y_upper   <- max(plot_df$hi, na.rm = TRUE)
+y_range   <- y_upper - y_lower
+if (!is.finite(y_range) || y_range <= 0) {
+  y_range <- 0.05
+}
+
+y_star    <- y_upper + 0.08 * y_range
+y_bracket <- y_upper + 0.05 * y_range
+
+ggplot(plot_df, aes(x = group, y = mean, fill = group)) +
+  geom_col(width = 0.6) +
+  geom_errorbar(aes(ymin = lo, ymax = hi), width = 0.12) +
+  scale_fill_manual(values = c("Control" = "grey70", "Treatment" = "#2ca25f")) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  coord_cartesian(ylim = c(y_lower, y_star + 0.02), clip = "off") +
+  labs(
+    title = "Interannual Variability in GPP (ΔCV)",
+    x     = NULL,
+    y     = "Mean ΔCV"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  annotate("segment", x = 1, xend = 2,
+           y = y_bracket, yend = y_bracket, linewidth = 0.6) +
+  annotate("text", x = 1.5, y = y_star,
+           label = stars, size = 6)
+
+cat("\n(Significance stars on plot based on 5 km clustered SE p-value.)\n")
+
+# =========================
+# E) ATT using 5 km clustered SEs
+# =========================
+cat("\n=== ATT for delta_cv (Treatment vs Control among treated) ===\n")
+
+mf_ols <- model.frame(mod_cv)
+
+att_ols <- marginaleffects::avg_comparisons(
+  mod_cv,
+  variables = list(TREATMENT = c(0, 1)),  # 0 -> 1
+  subset   = mf_ols$TREATMENT == 1,       # treated units only
+  vcov     = Vcov_cluster                 # use clustered SEs
+)
+
+print(att_ols)
+summary(att_ols)
+
+# =========================
+# F) Sensemakr sensitivity (5 km cluster-robust)
+# =========================
+
+se_treat_cluster <- sqrt(diag(Vcov_cluster))["TREATMENT"]
+
+run_sensemakr <- function(benchmark_var, kd_seq = 1:9) {
+  if (!benchmark_var %in% colnames(df_ols)) {
+    cat("\n[Sensemakr] Skipping benchmark", benchmark_var,
+        ": not found in data.\n")
+    return(invisible(NULL))
+  }
+  cat("\n==== Sensemakr benchmark:", benchmark_var, "====\n")
+  sm <- sensemakr::sensemakr(
+    model                = mod_cv,
+    treatment            = "TREATMENT",
+    benchmark_covariates = benchmark_var,
+    kd                   = kd_seq,
+    se                   = se_treat_cluster,
+    alpha                = 0.05
+  )
+  print(summary(sm))
+  invisible(sm)
+}
