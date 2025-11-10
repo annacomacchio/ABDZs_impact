@@ -1,0 +1,343 @@
+# =========================================================
+# Script name: analysis_gpp_mean_delta_5km_cluster.R
+# Project:     ABDZs_impact
+#
+# Purpose:
+#   Analysis of change in mean GPP (ΔMean):
+#     - Uses matched ABDZ vs control sample: GPPmean_matched_CAL.shp
+#     - Defines:
+#         mean_w1 = mean(GPP_2001–2003)
+#         mean_w2 = mean(GPP_2020–2022)
+#         delta_mean = mean_w2 - mean_w1
+#     - Computes summary statistics by treatment group
+#     - Fits OLS for delta_mean with covariate controls
+#       (excluding baseline mean_w1 to avoid post-matching overcontrol)
+#     - Uses ONLY 5 km grid cluster-robust (HC1) SEs:
+#         * for coefficient inference
+#         * for significance stars on the plot
+#
+# Input:
+#   - GPP_exports/GPPmean_matched_CAL.shp
+#
+# Outputs (printed / plotted in R session):
+#   - Summary stats for mean_w1, mean_w2, delta_mean by treatment
+#   - OLS table with 5 km clustered SEs
+#   - Barplot (Treatment vs Control, mean ΔMean + CI + stars)
+# =========================================================
+
+suppressPackageStartupMessages({
+  library(sf)
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(ggplot2)
+  library(lmtest)
+  library(sandwich)
+  library(gstat)
+  library(sp)
+})
+
+set.seed(42)
+
+# -----------------------------
+# 0) Load matched CAL shapefile
+# -----------------------------
+shp_path <- "GPP_exports/GPPmean_matched_CAL.shp"
+stopifnot(file.exists(shp_path))
+
+sf_cal <- sf::st_read(shp_path, quiet = TRUE)
+
+# -----------------------------
+# 1) Rename truncated fields -> standard names
+# -----------------------------
+rename_if_present <- function(df, from, to) {
+  if (from %in% names(df)) {
+    names(df)[names(df) == from] <- to
+  }
+  df
+}
+
+sf_cal <- sf_cal |>
+  rename_if_present("TREATME", "TREATMENT") |>
+  rename_if_present("accssbl", "accessibility") |>
+  rename_if_present("elevatn", "elevation") |>
+  rename_if_present("prcpttn", "precipitation") |>
+  rename_if_present("temprtr", "temperature") |>
+  rename_if_present("dstnc__", "distance_to_road") |>
+  rename_if_present("Ag_2000", "Agriculture_2000") |>
+  rename_if_present("ppltn_d", "population_density")
+
+# -----------------------------
+# 2) Coerce treatment to 0/1
+# -----------------------------
+to_int01 <- function(x){
+  if (is.factor(x)) x <- as.character(x)
+  if (is.character(x)) {
+    xl <- tolower(trimws(x))
+    x <- ifelse(
+      xl %in% c("1","true","t","yes","y","treated","treatment"), 1L,
+      ifelse(
+        xl %in% c("0","false","f","no","n","control"), 0L,
+        NA_integer_
+      )
+    )
+  }
+  if (is.logical(x)) x <- as.integer(x)
+  if (is.numeric(x)) x <- as.integer(x != 0 & !is.na(x))
+  as.integer(x)
+}
+
+stopifnot("TREATMENT" %in% names(sf_cal))
+sf_cal$TREATMENT <- to_int01(sf_cal$TREATMENT)
+
+# -----------------------------
+# 3) Ensure mean_w1, mean_w2, delta_mean exist
+#    w1 = 2001–2003, w2 = 2020–2022
+# -----------------------------
+years_w1 <- 2001:2003
+years_w2 <- 2020:2022
+
+if (!"mean_w1" %in% names(sf_cal)) {
+  w1_cols <- intersect(paste0("GPP_", years_w1), names(sf_cal))
+  if (length(w1_cols) > 0) {
+    sf_cal <- sf_cal %>%
+      dplyr::mutate(mean_w1 = rowMeans(dplyr::across(dplyr::all_of(w1_cols)), na.rm = TRUE))
+  }
+}
+
+if (!"mean_w2" %in% names(sf_cal)) {
+  w2_cols <- intersect(paste0("GPP_", years_w2), names(sf_cal))
+  if (length(w2_cols) > 0) {
+    sf_cal <- sf_cal %>%
+      dplyr::mutate(mean_w2 = rowMeans(dplyr::across(dplyr::all_of(w2_cols)), na.rm = TRUE))
+  }
+}
+
+if (!"delta_mean" %in% names(sf_cal) &&
+    all(c("mean_w1", "mean_w2") %in% names(sf_cal))) {
+  sf_cal <- sf_cal %>%
+    dplyr::mutate(delta_mean = mean_w2 - mean_w1)
+}
+
+if (!"delta_mean" %in% names(sf_cal)) {
+  stop("delta_mean is not available and cannot be constructed.")
+}
+
+# =========================
+# A) Summary stats (mean GPP)
+# =========================
+metrics <- intersect(c("mean_w1","mean_w2","delta_mean"), names(sf_cal))
+
+summ_by_group <- sf_cal %>%
+  sf::st_drop_geometry() %>%
+  dplyr::group_by(TREATMENT) %>%
+  dplyr::summarise(
+    dplyr::across(
+      dplyr::all_of(metrics),
+      list(
+        mean = ~mean(., na.rm = TRUE),
+        sd   = ~sd(.,   na.rm = TRUE),
+        n    = ~sum(is.finite(.))
+      ),
+      .names = "{.col}_{.fn}"
+    ),
+    .groups = "drop"
+  )
+
+cat("
+=== Summary statistics by treatment group (mean GPP) ===
+")
+print(summ_by_group)
+
+# =========================
+# B) Group means of ΔMean + 95% CI
+# =========================
+df_all <- sf_cal %>% sf::st_drop_geometry()
+
+plot_df <- df_all %>%
+  dplyr::filter(is.finite(delta_mean)) %>%
+  dplyr::group_by(TREATMENT) %>%
+  dplyr::summarise(
+    mean = mean(delta_mean, na.rm = TRUE),
+    sd   = sd(delta_mean,   na.rm = TRUE),
+    n    = dplyr::n(),
+    se   = sd / sqrt(pmax(n, 1)),
+    tcrit= qt(0.975, df = pmax(n - 1, 1)),
+    lo   = mean - tcrit * se,
+    hi   = mean + tcrit * se,
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    group = factor(
+      ifelse(TREATMENT == 1L, "Treatment", "Control"),
+      levels = c("Control", "Treatment")
+    )
+  )
+
+# =========================
+# C) OLS for ΔMean GPP with covariate controls
+#     + 5 km cluster-robust SEs (ONLY)
+# =========================
+
+# Covariates (mean_w1 intentionally EXCLUDED)
+covariates <- c(
+  "precipitation","temperature","population_density","elevation",
+  "slope","distance_to_road","accessibility","Agriculture_2000","INCOME"
+)
+covariates_present <- intersect(covariates, names(df_all))
+if (!length(covariates_present)) {
+  stop("No expected covariates found in matched dataset.")
+}
+
+# Ensure ID for alignment
+if (!"ID" %in% names(sf_cal)) {
+  sf_cal$ID <- seq_len(nrow(sf_cal))
+}
+
+# Clean analysis df
+df_ols <- df_all %>%
+  dplyr::mutate(
+    TREATMENT = as.integer(TREATMENT),
+    dplyr::across(
+      dplyr::all_of(c("delta_mean", covariates_present)),
+      ~ suppressWarnings(as.numeric(.))
+    )
+  ) %>%
+  dplyr::filter(
+    TREATMENT %in% c(0L, 1L),
+    is.finite(delta_mean),
+    dplyr::if_all(
+      dplyr::all_of(covariates_present),
+      ~ is.finite(.) & !is.na(.)
+    )
+  )
+
+if (nrow(df_ols) == 0L) {
+  stop("No observations left after cleaning for OLS.")
+}
+
+# Build sf object aligned to df_ols for clustering
+sf_use <- sf_cal[match(df_ols$ID, sf_cal$ID), ]
+
+# 5 km clusters using centroids
+crs_obj <- sf::st_crs(sf_use)
+if (isTRUE(crs_obj$IsGeographic) || is.na(crs_obj)) {
+  message("Reprojecting to UTM (EPSG:32718 assumed) for 5 km clusters...")
+  sf_use <- sf::st_transform(sf_use, 32718)
+}
+
+centroids <- sf::st_centroid(sf_use)
+coords    <- sf::st_coordinates(centroids)
+
+sf_use <- sf_use %>%
+  dplyr::mutate(
+    cell_x     = floor(coords[,1] / 5000),
+    cell_y     = floor(coords[,2] / 5000),
+    cluster_id = paste0(cell_x, "_", cell_y)
+  )
+
+df_ols$cluster_id <- sf_use$cluster_id
+
+cat("
+Number of 5 km clusters: ",
+    length(unique(df_ols$cluster_id)), "
+")
+
+# OLS formula & fit
+rhs <- paste(c("TREATMENT", covariates_present), collapse = " + ")
+form_mean <- stats::as.formula(paste("delta_mean ~", rhs))
+
+mod_mean <- lm(form_mean, data = df_ols)
+
+# 5 km cluster-robust vcov
+Vcov_mean <- sandwich::vcovCL(
+  mod_mean,
+  cluster = df_ols$cluster_id,
+  type    = "HC1"
+)
+
+cat("
+=== OLS for ΔMean GPP with 5 km CLUSTER-robust SEs ===
+")
+ct_mean <- lmtest::coeftest(mod_mean, vcov. = Vcov_mean)
+print(ct_mean)
+
+if (!"TREATMENT" %in% rownames(ct_mean)) {
+  stop("TREATMENT coefficient not found in OLS output.")
+}
+pval_m <- unname(ct_mean["TREATMENT", "Pr(>|t|)"])
+
+get_stars <- function(p) {
+  if (is.na(p))      "n.s."
+  else if (p < 0.001) "***"
+  else if (p < 0.01)  "**"
+  else if (p < 0.05)  "*"
+  else if (p < 0.10)  "·"
+  else               "n.s."
+}
+stars_m <- get_stars(pval_m)
+
+# =========================
+# D) Barplot with significance stars
+# =========================
+y_lower_m <- min(plot_df$lo, na.rm = TRUE)
+y_upper_m <- max(plot_df$hi, na.rm = TRUE)
+y_range_m <- ifelse(is.finite(y_upper_m - y_lower_m) && (y_upper_m - y_lower_m) > 0,
+                    y_upper_m - y_lower_m, 0.05)
+
+y_bracket_m <- y_upper_m + 0.05 * y_range_m
+y_star_m    <- y_upper_m + 0.08 * y_range_m
+
+ggplot(plot_df, aes(x = group, y = mean, fill = group)) +
+  geom_col(width = 0.6, color = "grey30") +
+  geom_errorbar(aes(ymin = lo, ymax = hi), width = 0.12) +
+  scale_fill_manual(values = c("Control" = "grey70", "Treatment" = "#2ca25f")) +
+  geom_hline(yintercept = 0, linetype = 2, color = "grey50") +
+  coord_cartesian(ylim = c(y_lower_m, y_star_m + 0.02), clip = "off") +
+  labs(
+    title = "Change in Mean Productivity (GPP)",
+    x     = NULL,
+    y     = "Mean ΔGPP"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position      = "none",
+    panel.grid.major.x   = element_blank(),
+    panel.grid.minor.x   = element_blank()
+  ) +
+  annotate("segment",
+           x = 1, xend = 2,
+           y = y_bracket_m, yend = y_bracket_m,
+           linewidth = 0.6) +
+  annotate("text",
+           x = 1.5, y = y_star_m,
+           label = stars_m, size = 6)
+
+cat("
+(Significance star uses 5 km clustered SE for TREATMENT.)
+")
+
+# =========================
+# E) Residual diagnostics (optional)
+# =========================
+do_residual_plots <- FALSE
+
+if (do_residual_plots) {
+  plot_residuals <- function(model, title_prefix = "Model") {
+    res <- stats::residuals(model)
+    fit <- stats::fitted(model)
+    op  <- par(no.readonly = TRUE); on.exit(par(op))
+    par(mfrow = c(1,3))
+    plot(fit, res,
+         main = paste(title_prefix, "- Residuals vs Fitted"),
+         xlab = "Fitted", ylab = "Residuals")
+    abline(h = 0, lty = 2)
+    hist(res,
+         main = paste(title_prefix, "- Residuals Histogram"),
+         xlab = "Residuals")
+    qqnorm(res,
+           main = paste(title_prefix, "- Normal Q-Q"))
+    qqline(res)
+  }
+  plot_residuals(mod_mean, "ΔMean GPP")
+}
