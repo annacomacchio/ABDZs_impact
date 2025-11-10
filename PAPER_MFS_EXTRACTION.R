@@ -1,0 +1,14163 @@
+# --- Create spatially balanced batches in UTM 18S (EPSG:32718) ---
+library(sf)
+library(dplyr)
+
+set.seed(42)  # reproducible clustering
+dir.create("converted", showWarnings = FALSE, recursive = TRUE)
+
+# INPUT: your big layer (shp or gpkg)
+big_path <- "COV_ALL_NO_COTAHUASI.shp"  # change if needed
+target_batches <- 80
+epsg <- 32718  # WGS84 / UTM 18S
+
+# 1) Read + ensure ID column
+big <- st_read(big_path, quiet = TRUE)
+if (!("ID" %in% names(big))) big$ID <- seq_len(nrow(big))
+
+# 2) Reproject to UTM 18S
+if (is.na(st_crs(big))) {
+  stop("Your input has no CRS defined. Set it first (st_set_crs) before transforming.")
+}
+big_utm <- st_transform(big, epsg)
+
+# 3) K-means on centroids (spatially compact batches)
+pts <- st_point_on_surface(big_utm)
+xy  <- st_coordinates(pts)
+
+km <- kmeans(xy, centers = target_batches, iter.max = 200, nstart = 10)
+big_utm$batch_id <- km$cluster
+
+# 4) Make nice two-digit codes and write outputs
+big_utm$batch_code <- sprintf("%02d", as.integer(factor(big_utm$batch_id)))
+
+# Manifest (ID -> batch_code)
+manifest <- big_utm |>
+  st_drop_geometry() |>
+  select(ID, batch_code)
+write.csv(manifest, "converted/batch_manifest.csv", row.names = FALSE)
+
+# Per-batch files (all in EPSG:32718)
+for (b in sort(unique(big_utm$batch_code))) {
+  message("Writing batch ", b)
+  out <- big_utm %>% filter(batch_code == b) %>% select(-batch_id, -batch_code)
+  st_write(out, paste0("converted/grid_batch_", b, "_utm.gpkg"),
+           delete_dsn = TRUE, quiet = TRUE)
+}
+
+message("✅ Wrote ", length(unique(big_utm$batch_code)),
+        " batches to /converted (UTM 18S) + batch_manifest.csv")
+
+
+
+
+
+
+
+
+
+###### loop 1 #####
+
+# --- worker_batch_01.R : runs ONE batch (fixed to BATCH_ID = "01") ---
+BATCH_ID <- "01"
+
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+cat(sprintf("\n##### batch %s #####\n", BATCH_ID))
+
+if (exists("BATCH_ID", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "BATCH_ID"), envir = .GlobalEnv)
+}
+
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# --- Inputs ---
+input_path <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", BATCH_ID))
+
+# Cropland rasters (binary 0/1, adjust paths if needed)
+r_crop_2000 <- rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- rast("NEW_cropland_mask_1km_2022_utm.tif")
+
+if (!file.exists(input_path)) stop("Missing input: ", input_path)
+batch_vect <- vect(input_path)
+batch_sf   <- st_as_sf(batch_vect)
+
+# Project polygons to each raster CRS
+batch_vect_2000 <- project(batch_vect, crs(r_crop_2000))
+batch_vect_2022 <- project(batch_vect, crs(r_crop_2022))
+
+# --- Patch metric function (counts only cropland, value==1) ---
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  px_area_m2 <- prod(res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    tryCatch({
+      geom <- grid_vect[i]
+      r <- crop(crop_raster, geom)
+      r <- mask(r, geom)
+      r <- mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      s <- global(r, "sum", na.rm = TRUE)[["sum"]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        cl <- clumps(r, directions = 8, gaps = FALSE)
+        ft <- as.data.frame(freq(cl, useNA = "no"))
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", BATCH_ID)))
+  }
+  
+  results
+}
+
+# --- Run metrics for both years ---
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, batch_vect_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, batch_vect_2022)
+
+# --- Attach to sf & save ---
+batch_sf$n_patches_2000            <- metrics_2000$n_patches
+batch_sf$mean_patch_size_ha_2000   <- metrics_2000$mean_patch_size_ha
+batch_sf$n_patches_2022            <- metrics_2022$n_patches
+batch_sf$mean_patch_size_ha_2022   <- metrics_2022$mean_patch_size_ha
+batch_sf$delta_n_patches           <- batch_sf$n_patches_2022 - batch_sf$n_patches_2000
+batch_sf$delta_mean_patch_size     <- batch_sf$mean_patch_size_ha_2022 - batch_sf$mean_patch_size_ha_2000
+
+# Save
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", BATCH_ID))
+st_write(batch_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", BATCH_ID, "processed and saved to:\n", output_path, "\n")
+
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+###### loop 2 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "02"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+
+
+###### loop 3 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "03"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+
+###### loop 4 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "04"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 5 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "05"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 6 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "06"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 7 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "07"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+
+###### loop 7 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "07"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 7 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "07"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 8 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "08"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 9 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "09"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 10 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "10"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 11 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "11"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+
+###### loop 11 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "11"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 12 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "12"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 13 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "13"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 14 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "14"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 15 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "15"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 16 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "16"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 17 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "17"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 18 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "18"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 19 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "19"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+
+###### loop 20 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "20"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 21 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "21"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 22 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "22"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 23 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "23"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 24 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "24"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 25 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "25"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 26 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "26"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 27 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "27"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 28 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "28"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 29 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "29"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 30 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "30"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 31 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "31"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 32 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "32"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+
+###### loop 33 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "33"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 34 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "34"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 35 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "35"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 36 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "36"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 37 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "37"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 38 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "38"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 39 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "39"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 40 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "40"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 41 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "41"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+
+###### loop 42 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "42"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 43 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "43"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 44 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "44"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 45 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "45"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 46 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "46"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 47 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "47"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 48 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "48"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 49 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "49"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 50 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "50"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 51 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "51"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 52 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "52"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 53 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "53"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+
+###### loop 54 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "54"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 55 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "55"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 56 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "56"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 57 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "57"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 58 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "58"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 59 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "59"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 60 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "60"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 61 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "61"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 62 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "62"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 63 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "63"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+
+###### loop 64 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "64"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 65 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "65"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 66 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "66"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 67 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "67"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 68 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "68"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 69 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "69"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 70 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "70"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 71 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "71"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+###### loop 72 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "72"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+
+###### loop 73 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "73"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+
+###### loop 74 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "74"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+
+###### loop 75 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "75"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+
+###### loop 76 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "76"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+
+###### loop 77 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "77"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+
+###### loop 78 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "63"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+
+
+
+###### loop 79 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "79"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+
+
+###### loop 80 ##### 
+
+# 0) libs + options
+suppressPackageStartupMessages({
+  library(sf)
+  library(terra)
+  library(dplyr)
+})
+terraOptions(threads = 1)
+
+# 1) choose batch (EDIT THIS)
+batch_id <- "80"  # <-- change per batch "01".."80"
+
+cat(sprintf("\n##### batch %s #####\n", batch_id))
+
+# Keep only batch_id in env (optional hygiene)
+if (exists("batch_id", inherits = FALSE)) {
+  objs <- ls(envir = .GlobalEnv)
+  rm(list = setdiff(objs, "batch_id"), envir = .GlobalEnv)
+}
+
+# hygiene
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+cat("🧹 Memory fully cleared before starting this batch.\n")
+
+# 2) inputs: grids + cropland rasters
+# primary location (your latest layout)
+gpkg_primary   <- file.path("batches_80", sprintf("grid_batch_%s_utm.gpkg", batch_id))
+# fallback to your older 'converted' folder if needed
+gpkg_fallback  <- file.path("converted",  sprintf("grid_batch_%s_utm.gpkg", batch_id))
+input_path <- if (file.exists(gpkg_primary)) gpkg_primary else gpkg_fallback
+
+if (!file.exists(input_path)) stop("Missing input grid: ", normalizePath(input_path, mustWork = FALSE))
+cat("📦 Using grid file: ", normalizePath(input_path, mustWork = FALSE), "\n")
+
+# rasters (binary 0/1 cropland)
+r_crop_2000 <- terra::rast("NEW_cropland_mask_1km_2000_utm.tif")
+r_crop_2022 <- terra::rast("NEW_cropland_mask_1km_2022_utm.tif")  # rename if actually 2020
+
+# 3) read grids + ensure ID
+grid_vect <- terra::vect(input_path)
+grid_sf   <- sf::st_as_sf(grid_vect)  # we’ll attach outputs to this and write
+
+if (!"ID" %in% names(grid_vect)) {
+  grid_vect$ID <- seq_len(nrow(grid_vect))
+  grid_sf$ID   <- grid_vect$ID
+}
+
+# 4) project grids to each raster’s CRS (cheap and alignment-safe)
+grid_2000 <- terra::project(grid_vect, terra::crs(r_crop_2000))
+grid_2022 <- terra::project(grid_vect, terra::crs(r_crop_2022))
+
+# 5) helper: patch metrics (counts only cropland = 1)
+get_patch_metrics <- function(crop_raster, grid_vect) {
+  # results table
+  results <- data.frame(
+    ID = grid_vect$ID,
+    n_patches = NA_integer_,
+    mean_patch_size_ha = NA_real_
+  )
+  failed_rows <- character(0)
+  pb <- txtProgressBar(min = 0, max = nrow(grid_vect), style = 3)
+  
+  # pixel area (handles non-square pixels) — assumes projected units are meters
+  px_area_m2 <- prod(terra::res(crop_raster))
+  
+  for (i in seq_len(nrow(grid_vect))) {
+    setTxtProgressBar(pb, i)
+    this_id <- grid_vect$ID[i]
+    
+    tryCatch({
+      geom <- grid_vect[i]
+      
+      # crop & mask to polygon
+      r <- terra::crop(crop_raster, geom)
+      r <- terra::mask(r, geom)
+      
+      # KEEP ONLY CROPLAND (1). Turn 0 -> NA, keep 1 as-is
+      # (equivalent to your intention “keep only metrics from cropland”)
+      r <- terra::mask(r, r, maskvalues = 0, updatevalue = NA)
+      
+      # fast exit if no cropland inside polygon
+      s <- terra::global(r, "sum", na.rm = TRUE)[[1]]
+      if (is.na(s) || s == 0) {
+        results$n_patches[i] <- 0L
+        results$mean_patch_size_ha[i] <- 0
+      } else {
+        # contiguous cropland patches (8-neighbour)
+        cl <- terra::patches(r, directions = 8, zeroAsNA = TRUE)
+        
+        # robust freq handling across terra versions (no useNA arg)
+        ft <- terra::freq(cl)
+        ft <- as.data.frame(ft)
+        
+        # standardize column names
+        # 'value' is patch label; 'count' is cell count; older versions may use 'layer'/'frequency'
+        if (!"count" %in% names(ft) && "frequency" %in% names(ft)) {
+          names(ft)[names(ft) == "frequency"] <- "count"
+        }
+        valcol <- if ("value" %in% names(ft)) "value" else if ("layer" %in% names(ft)) "layer" else names(ft)[1]
+        
+        # drop NA/invalid labels (background)
+        if (nrow(ft) > 0) {
+          ft <- ft[!is.na(ft[[valcol]]), , drop = FALSE]
+        }
+        
+        if (nrow(ft) == 0) {
+          results$n_patches[i] <- 0L
+          results$mean_patch_size_ha[i] <- 0
+        } else {
+          patch_area_m2 <- ft$count * px_area_m2
+          results$n_patches[i] <- nrow(ft)
+          results$mean_patch_size_ha[i] <- mean(patch_area_m2) / 1e4  # m² -> ha
+        }
+      }
+    }, error = function(e) {
+      message(sprintf("❌ ERROR at row %d (ID: %s): %s", i, this_id, e$message))
+      results$n_patches[i] <- NA_integer_
+      results$mean_patch_size_ha[i] <- NA_real_
+      failed_rows <<- c(failed_rows, this_id)
+    })
+    
+    # tidy between iterations
+    gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+  }
+  
+  close(pb)
+  
+  # log failures (if any)
+  if (length(failed_rows) > 0) {
+    dir.create("results_80_NEW", showWarnings = FALSE, recursive = TRUE)
+    writeLines(failed_rows, file.path("results_80_NEW", sprintf("failed_ids_batch_%s.txt", batch_id)))
+  }
+  
+  results
+}
+
+# 6) run metrics for both years
+cat("🔎 Processing cropland patches for 2000...\n")
+metrics_2000 <- get_patch_metrics(r_crop_2000, grid_2000)
+
+cat("🔎 Processing cropland patches for 2022...\n")
+metrics_2022 <- get_patch_metrics(r_crop_2022, grid_2022)
+
+# 7) attach to sf & save
+grid_sf$n_patches_2000          <- metrics_2000$n_patches
+grid_sf$mean_patch_size_ha_2000 <- metrics_2000$mean_patch_size_ha
+grid_sf$n_patches_2022          <- metrics_2022$n_patches
+grid_sf$mean_patch_size_ha_2022 <- metrics_2022$mean_patch_size_ha
+grid_sf$delta_n_patches         <- grid_sf$n_patches_2022 - grid_sf$n_patches_2000
+grid_sf$delta_mean_patch_size   <- grid_sf$mean_patch_size_ha_2022 - grid_sf$mean_patch_size_ha_2000
+
+
+# 8) write output
+output_dir  <- "results_80_NEW"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+output_path <- file.path(output_dir, sprintf("patch_metrics_batch_%s.gpkg", batch_id))
+sf::st_write(grid_sf, output_path, delete_layer = TRUE, quiet = TRUE)
+
+cat("✅ Batch", batch_id, "processed and saved to:\n", normalizePath(output_path, mustWork = FALSE), "\n")
+
+# final clean
+gc(); try(terra::tmpFiles(remove = TRUE), silent = TRUE)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# merge_patch_metrics_all.R
+# Combines results_80_NEW/patch_metrics_batch_01..80.gpkg into one GeoPackage:
+# results_80_NEW/patch_metrics_all.gpkg (layer: "patch_metrics_all")
+
+# --- deps ---
+suppressPackageStartupMessages({
+  if (!requireNamespace("sf", quietly = TRUE)) install.packages("sf", repos = "https://cloud.r-project.org")
+  if (!requireNamespace("dplyr", quietly = TRUE)) install.packages("dplyr", repos = "https://cloud.r-project.org")
+  if (!requireNamespace("purrr", quietly = TRUE)) install.packages("purrr", repos = "https://cloud.r-project.org")
+  library(sf)
+  library(dplyr)
+  library(purrr)
+})
+
+base_dir <- "results_80_NEW"
+batches  <- sprintf("%02d", 1:80)
+paths    <- file.path(base_dir, sprintf("patch_metrics_batch_%s.gpkg", batches))
+
+# Helper: read one GPKG, return NULL on failure
+read_one <- function(p) {
+  if (!file.exists(p)) {
+    message("⚠️ Missing file: ", p)
+    return(NULL)
+  }
+  lyr <- tryCatch({
+    layers <- sf::st_layers(p)$name
+    sf::st_read(p, layer = layers[1], quiet = TRUE)
+  }, error = function(e) {
+    message("❌ Failed to read: ", p, " — ", e$message)
+    NULL
+  })
+  if (!is.null(lyr)) {
+    # ensure a batch_id column for provenance
+    if (!"batch_id" %in% names(lyr)) {
+      bi <- sub("^.*batch_(\\d{2}).*$", "\\1", basename(p))
+      lyr$batch_id <- bi
+    }
+  }
+  lyr
+}
+
+# Read all available layers
+sflist <- purrr::map(paths, read_one)
+sflist <- purrr::compact(sflist)
+
+if (length(sflist) == 0) {
+  stop("No batch files could be read. Make sure '", base_dir, "' contains the expected GeoPackages.")
+}
+
+# Harmonize CRS (transform to the CRS of the first sf if needed)
+target_crs <- sf::st_crs(sflist[[1]])
+sflist <- purrr::map(sflist, function(x) {
+  this_crs <- sf::st_crs(x)
+  if (!is.na(this_crs) && !is.na(target_crs) && this_crs != target_crs) {
+    sf::st_transform(x, target_crs)
+  } else {
+    x
+  }
+})
+
+# Ensure common columns (union of names); add missing as NA and reorder
+all_cols <- Reduce(union, lapply(sflist, names))
+sflist <- purrr::map(sflist, function(x) {
+  missing <- setdiff(all_cols, names(x))
+  for (m in missing) x[[m]] <- NA
+  x[, all_cols, drop = FALSE]
+})
+
+# Row-bind
+combined <- do.call(rbind, sflist)
+
+# Output
+dir.create(base_dir, showWarnings = FALSE, recursive = TRUE)
+out_path <- file.path(base_dir, "patch_metrics_all.gpkg")
+if (file.exists(out_path)) unlink(out_path)
+
+sf::st_write(combined, out_path, layer = "patch_metrics_all", quiet = TRUE)
+cat("✅ Wrote", nrow(combined), "features to:\n", normalizePath(out_path, mustWork = FALSE), "\n")
