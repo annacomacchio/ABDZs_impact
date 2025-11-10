@@ -1,0 +1,664 @@
+# =====================================================================
+# Script name: 09_Agri_expansion_nat_cover_loss_permutations_.R
+# Project:     ABDZs_impact
+#
+# Purpose:
+#   Specification-curve robustness for:
+#     - Agricultural expansion
+#     - Natural cover loss
+#
+#   Steps:
+#     1) Load covariates grid and remove outer 10-km buffer.
+#     2) Keep full 1x1 km pixels.
+#     3) Build 4-km lattice; select 1 unit per cell
+#        (priority: ABDZ core > treated > control; then nearest cell center).
+#     4) For multiple covariate sets & distance metrics:
+#          - NN matching with logit PS (caliper 0.2 SD)
+#          - NN matching with Mahalanobis
+#          - Optionally NN with random forest distance (if ranger installed)
+#        Run OLS:
+#          outcome ~ TREATMENT + covariates   (classical SE only).
+#     5) Produce:
+#          - schart-style spec curves for both outcomes
+#          - spec grid plots showing which specs yield which effects.
+#
+# Inputs:
+#   - COVARIATES_ALL_NO_COTAHUASI.shp
+#   - OUTER_BUFFER_10km.shp
+#
+# Notes:
+#   - Only classical OLS SEs (no HC / cluster / spatial).
+#   - Set main_effect_agri / main_effect_nat to your preferred main estimates.
+# =====================================================================
+
+suppressPackageStartupMessages({
+  library(sf)
+  library(dplyr)
+  library(MatchIt)
+  library(cobalt)
+  library(tidyr)
+  library(stringr)
+  library(ggplot2)
+})
+
+set.seed(42)
+
+# ---------------------------------------------------------------------
+# 0. Parameters
+# ---------------------------------------------------------------------
+epsg_utm           <- 32718
+pixel_size_m       <- 1000
+pixel_area_full    <- pixel_size_m^2
+min_pixel_fullness <- 1.0      # require full 1 km² pixels
+spacing_m          <- 4000     # 4-km lattice spacing
+cal_sd             <- 0.2      # PS caliper (SD units)
+
+# Reference effects (set from your preferred "main" model)
+main_effect_agri <- 0.00
+main_effect_nat  <- 0.00
+
+# ---------------------------------------------------------------------
+# 1. Helpers
+# ---------------------------------------------------------------------
+to_int01 <- function(x){
+  if (is.factor(x)) x <- as.character(x)
+  if (is.character(x)) {
+    xl <- tolower(trimws(x))
+    x <- ifelse(
+      xl %in% c("1","true","t","yes","y","treated","treatment","abdz"), 1L,
+      ifelse(xl %in% c("0","false","f","no","n","control"), 0L, NA_integer_)
+    )
+  }
+  if (is.logical(x)) x <- as.integer(x)
+  if (is.numeric(x)) x <- as.integer(x != 0 & !is.na(x))
+  as.integer(x)
+}
+
+as_df_no_geom <- function(z) {
+  if (inherits(z, "sf")) sf::st_drop_geometry(z) else z
+}
+
+# schart: base-R coefficient plot with CIs and highlighting
+if (!exists("schart")) {
+  schart <- function(data,
+                     index.est = 1,
+                     index.se  = 2,
+                     order     = "asis",
+                     ci        = 0.95,
+                     ref       = 0,
+                     lwd.est   = 2,
+                     pch.est   = 21,
+                     lwd.symbol= 1.5,
+                     col.est   = c("grey60","red3","blue3"),
+                     bg.est    = c("white","white"),
+                     lwd.border= 1,
+                     lty.ref   = 2,
+                     col.ref   = "black",
+                     leftmargin= 6) {
+
+    d <- data
+    rownames(d) <- seq_len(nrow(d))
+
+    o <- switch(
+      order,
+      "increasing" = order(d[, index.est]),
+      "decreasing" = order(-d[, index.est]),
+      "asis"       = seq_len(nrow(d)),
+      seq_len(nrow(d))
+    )
+    d <- d[o, , drop = FALSE]
+
+    est <- d[, index.est]
+    se  <- d[, index.se]
+    a   <- qnorm(1 - (1 - ci)/2)
+
+    l1 <- est - a * se
+    h1 <- est + a * se
+
+    meta_cols <- setdiff(colnames(d), colnames(d)[c(index.est, index.se)])
+    tab <- if (length(meta_cols)) t(d[, meta_cols, drop = FALSE]) else NULL
+
+    xs  <- seq_len(nrow(d))
+    ylim <- range(c(l1, h1, ref))
+    ylim <- ylim + diff(ylim)/10 * c(-1, 1)
+
+    par(mar = c(3, leftmargin, 1.5, 1))
+    plot(xs, est, xlab = "", ylab = "", axes = FALSE, type = "n",
+         ylim = ylim, xlim = range(xs))
+    abline(h = ref, lty = lty.ref, lwd = 1, col = col.ref)
+
+    colvec <- rep(col.est[1], nrow(d))
+    bgvec  <- rep(bg.est[1],  nrow(d))
+
+    if (!is.null(tab)) {
+      if ("MainModel" %in% rownames(tab)) {
+        main_idx <- tab["MainModel", ] == TRUE
+        colvec[main_idx] <- col.est[2]
+        bgvec[main_idx]  <- bg.est[2]
+      }
+      if ("Significant" %in% rownames(tab)) {
+        sig_idx <- tab["Significant", ] == TRUE &
+          (!"MainModel" %in% rownames(tab) | tab["MainModel", ] == FALSE)
+        colvec[sig_idx] <- col.est[3]
+      }
+    }
+
+    arrows(xs, l1, xs, h1, length = 0, code = 3,
+           lwd = lwd.est, col = colvec, angle = 90)
+    points(xs, est, pch = pch.est, lwd = lwd.symbol,
+           col = colvec, bg = bgvec)
+
+    axis(2, las = 2, cex.axis = 0.9, lwd = lwd.border)
+    axis(4, labels = NA, lwd = lwd.border)
+    box(lwd = lwd.border)
+
+    if (!is.null(tab) &&
+        "MainModel" %in% rownames(tab) &&
+        any(tab["MainModel", ] == TRUE)) {
+      idx_main <- which(tab["MainModel", ] == TRUE)[1]
+      abline(v = idx_main, col = "red3", lwd = 4)
+    }
+  }
+}
+
+# ---------------------------------------------------------------------
+# 2. Load covariate grid & apply outer buffer
+# ---------------------------------------------------------------------
+shp_path    <- "COVARIATES_ALL_NO_COTAHUASI.shp"
+buffer_path <- "OUTER_BUFFER_10km.shp"
+
+stopifnot(file.exists(shp_path), file.exists(buffer_path))
+
+all_gridcells <- sf::st_read(shp_path, quiet = TRUE) |>
+  sf::st_transform(epsg_utm)
+
+if (!"ID" %in% names(all_gridcells)) {
+  all_gridcells$ID <- seq_len(nrow(all_gridcells))
+}
+
+outer10 <- sf::st_read(buffer_path, quiet = TRUE) |>
+  sf::st_transform(epsg_utm)
+
+outer10_u <- sf::st_union(outer10)
+
+n0 <- nrow(all_gridcells)
+keep_idx <- lengths(sf::st_intersects(all_gridcells, outer10_u)) == 0L
+all_gridcells <- all_gridcells[keep_idx, , drop = FALSE]
+
+message("Removed ", n0 - nrow(all_gridcells),
+        " cells intersecting OUTER_BUFFER_10km; kept ", nrow(all_gridcells))
+
+# ---------------------------------------------------------------------
+# 3. Standardize names & keep full pixels
+# ---------------------------------------------------------------------
+all_gridcells <- all_gridcells |>
+  dplyr::rename(
+    precipitation      = PRECIPITAT,
+    temperature        = TEMP_MEAN,
+    population_density = POP_TOTAL,
+    accessibility      = ACCESSIBIL,
+    elevation          = ELEVATIONM,
+    distance_to_road   = Hub.distan,
+    slope              = SLOPEMEAN,
+    INCOME             = ing_pc_,
+    Forest_2000        = FOREST_200,
+    Grassland_2000     = GRASSLAND_,
+    Agriculture_2000   = AGRICULTUR
+  ) |>
+  dplyr::mutate(
+    TREATMENT  = to_int01(TREATMENT),
+    ABDZS_CORE = to_int01(ABDZS_CORE),
+    TREATMENT  = ifelse(ABDZS_CORE == 1L, 1L, TREATMENT) |> as.integer()
+  )
+
+all_gridcells <- all_gridcells |>
+  dplyr::mutate(
+    pixel_area_m2  = as.numeric(sf::st_area(geometry)),
+    pixel_fullness = pmin(pixel_area_m2 / pixel_area_full, 1)
+  )
+
+message("Pixels before fullness filter: ", nrow(all_gridcells))
+all_gridcells <- all_gridcells |>
+  dplyr::filter(pixel_fullness >= min_pixel_fullness)
+message("Pixels kept (fullness >= ", min_pixel_fullness, "): ", nrow(all_gridcells))
+
+# ---------------------------------------------------------------------
+# 4. Build 4-km lattice & strict thinning (1 per cell)
+# ---------------------------------------------------------------------
+cent <- sf::st_centroid(all_gridcells)
+xy   <- sf::st_coordinates(cent)
+
+all_gridcells <- all_gridcells %>%
+  dplyr::mutate(
+    x_coord = xy[,1],
+    y_coord = xy[,2]
+  )
+
+x0    <- min(all_gridcells$x_coord, na.rm = TRUE)
+y0    <- min(all_gridcells$y_coord, na.rm = TRUE)
+x_off <- x0 %% spacing_m
+y_off <- y0 %% spacing_m
+
+all_gridcells <- all_gridcells %>%
+  dplyr::mutate(
+    cell_x = floor((x_coord - x_off) / spacing_m),
+    cell_y = floor((y_coord - y_off) / spacing_m)
+  )
+
+sample_global_pref_core_treated <- function(df) {
+  df %>%
+    dplyr::group_by(cell_x, cell_y) %>%
+    dplyr::mutate(
+      cx    = cell_x * spacing_m + spacing_m/2 + x_off,
+      cy    = cell_y * spacing_m + spacing_m/2 + y_off,
+      d2    = (x_coord - cx)^2 + (y_coord - cy)^2,
+      p_core= if_else(ABDZS_CORE == 1L, 0L, 1L),
+      p_trt = if_else(TREATMENT  == 1L, 0L, 1L)
+    ) %>%
+    dplyr::arrange(p_core, p_trt, d2, .by_group = TRUE) %>%
+    dplyr::slice(1) %>%
+    dplyr::ungroup() %>%
+    dplyr::select(-cx, -cy, -d2, -p_core, -p_trt)
+}
+
+sf_sampled <- sample_global_pref_core_treated(all_gridcells)
+
+stopifnot(!any(duplicated(
+  sf::st_drop_geometry(sf_sampled)[, c("cell_x","cell_y")]
+)))
+
+message("After strict 4-km lattice sampling — n = ", nrow(sf_sampled))
+
+# ---------------------------------------------------------------------
+# 5. Matching specification grid
+# ---------------------------------------------------------------------
+sampled_gridcells_clean <- sf_sampled
+
+covariates_core <- c(
+  "precipitation","elevation","population_density",
+  "Forest_2000","Grassland_2000","Agriculture_2000"
+)
+optional_covs <- c("temperature","slope","accessibility","INCOME")
+all_covs      <- unique(c(covariates_core, optional_covs, "distance_to_road"))
+
+missing_covs <- setdiff(all_covs, names(sampled_gridcells_clean))
+if (length(missing_covs)) {
+  stop("Missing required covariates: ", paste(missing_covs, collapse = ", "))
+}
+
+sampled_gridcells_clean <- sampled_gridcells_clean %>%
+  dplyr::mutate(
+    dplyr::across(all_of(all_covs), ~ suppressWarnings(as.numeric(.))),
+    TREATMENT = as.integer(TREATMENT)
+  )
+
+data_match <- sampled_gridcells_clean %>%
+  dplyr::filter(
+    if_all(all_of(all_covs), ~ is.finite(.) & !is.na(.)),
+    TREATMENT %in% c(0L, 1L)
+  )
+
+# All subsets of optional covariates (including empty)
+optional_combos <- unlist(
+  lapply(0:length(optional_covs), function(k) {
+    if (k == 0) list(character(0)) else combn(optional_covs, k, simplify = FALSE)
+  }),
+  recursive = TRUE
+)
+
+multi_match_results <- list()
+rf_ok <- requireNamespace("ranger", quietly = TRUE)
+
+for (combo in optional_combos) {
+  combo <- unique(combo)
+  full_covs <- unique(c(covariates_core, combo, "distance_to_road"))
+  cov_formula <- as.formula(
+    paste("TREATMENT ~", paste(full_covs, collapse = " + "))
+  )
+  combo_label <- if (length(combo)) paste(combo, collapse = "--") else "none"
+  base_name   <- paste0("covs_", combo_label)
+
+  # Logit PS + caliper
+  m_logit <- MatchIt::matchit(
+    cov_formula,
+    data        = data_match,
+    method      = "nearest",
+    distance    = "logit",
+    caliper     = cal_sd,
+    std.caliper = TRUE
+  )
+  multi_match_results[[paste0(base_name, "_logit")]] <- m_logit
+
+  # Mahalanobis
+  m_mah <- MatchIt::matchit(
+    cov_formula,
+    data     = data_match,
+    method   = "nearest",
+    distance = "mahalanobis"
+  )
+  multi_match_results[[paste0(base_name, "_mahalanobis")]] <- m_mah
+
+  # Random forest distance (optional)
+  if (rf_ok) {
+    m_rf <- tryCatch(
+      MatchIt::matchit(
+        cov_formula,
+        data        = data_match,
+        method      = "nearest",
+        distance    = "randomforest",
+        caliper     = cal_sd,
+        std.caliper = TRUE
+      ),
+      error = function(e) NULL
+    )
+    if (!is.null(m_rf)) {
+      multi_match_results[[paste0(base_name, "_randomforest")]] <- m_rf
+    }
+  }
+}
+
+# ---------------------------------------------------------------------
+# 6. Define outcomes
+# ---------------------------------------------------------------------
+choose_outcomes <- function(df) {
+  out <- df
+
+  # Agricultural expansion
+  if ("AGRICULTU3" %in% names(out)) {
+    out$agri_outcome <- suppressWarnings(as.numeric(out$AGRICULTU3))
+  } else if ("agri_expansion" %in% names(out)) {
+    out$agri_outcome <- suppressWarnings(as.numeric(out$agri_expansion))
+  } else if (all(c("Agriculture_2020","Agriculture_2000") %in% names(out))) {
+    out$agri_outcome <- suppressWarnings(
+      as.numeric(out$Agriculture_2020 - out$Agriculture_2000)
+    )
+  } else {
+    stop("Agricultural expansion outcome not found.")
+  }
+
+  # Natural cover loss
+  if ("NATURAL_LO" %in% names(out)) {
+    out$nat_outcome <- suppressWarnings(as.numeric(out$NATURAL_LO))
+  } else if ("NATURAL" %in% names(out)) {
+    out$nat_outcome <- suppressWarnings(as.numeric(out$NATURAL))
+  } else if ("natural_cover_loss" %in% names(out)) {
+    out$nat_outcome <- suppressWarnings(as.numeric(out$natural_cover_loss))
+  } else if (all(c("Forest_2020","Grassland_2020",
+                   "Forest_2000","Grassland_2000") %in% names(out))) {
+    out$nat_outcome <- suppressWarnings(as.numeric(
+      (out$Forest_2000 + out$Grassland_2000) -
+        (out$Forest_2020 + out$Grassland_2020)
+    ))
+  } else {
+    stop("Natural cover loss outcome not found.")
+  }
+
+  out
+}
+
+# ---------------------------------------------------------------------
+# 7. Run OLS for each matched dataset (classical SE)
+# ---------------------------------------------------------------------
+ols_results <- data.frame()
+
+for (name in names(multi_match_results)) {
+
+  m_obj   <- multi_match_results[[name]]
+  matched <- MatchIt::match.data(m_obj)
+  matched <- choose_outcomes(matched)
+
+  if (length(unique(matched$TREATMENT)) < 2) next
+
+  fmla <- formula(m_obj)
+  rhs_terms <- attr(terms(fmla), "term.labels")
+  rhs <- if (length(rhs_terms)) paste(rhs_terms, collapse = " + ") else "1"
+
+  w <- if ("weights" %in% names(matched)) matched$weights else rep(1, nrow(matched))
+
+  # Agricultural expansion
+  if (sd(matched$agri_outcome, na.rm = TRUE) > 0) {
+    f_agri   <- as.formula(paste("agri_outcome ~ TREATMENT +", rhs))
+    fit_agri <- lm(f_agri, data = matched, weights = w)
+    cs       <- summary(fit_agri)$coefficients
+    if ("TREATMENT" %in% rownames(cs)) {
+      ols_results <- rbind(
+        ols_results,
+        data.frame(
+          Matching_Set = name,
+          Outcome      = "Agricultural expansion",
+          Estimate     = unname(cs["TREATMENT","Estimate"]),
+          Std_Error    = unname(cs["TREATMENT","Std. Error"]),
+          P_value      = unname(cs["TREATMENT","Pr(>|t|)"]),
+          stringsAsFactors = FALSE
+        )
+      )
+    }
+  }
+
+  # Natural cover loss
+  if (sd(matched$nat_outcome, na.rm = TRUE) > 0) {
+    f_nat   <- as.formula(paste("nat_outcome ~ TREATMENT +", rhs))
+    fit_nat <- lm(f_nat, data = matched, weights = w)
+    cs      <- summary(fit_nat)$coefficients
+    if ("TREATMENT" %in% rownames(cs)) {
+      ols_results <- rbind(
+        ols_results,
+        data.frame(
+          Matching_Set = name,
+          Outcome      = "Natural cover loss",
+          Estimate     = unname(cs["TREATMENT","Estimate"]),
+          Std_Error    = unname(cs["TREATMENT","Std. Error"]),
+          P_value      = unname(cs["TREATMENT","Pr(>|t|)"]),
+          stringsAsFactors = FALSE
+        )
+      )
+    }
+  }
+}
+
+stopifnot(nrow(ols_results) > 0)
+message("Total OLS fits stored: ", nrow(ols_results))
+
+# ---------------------------------------------------------------------
+# 8. Spec-curve schart plots
+# ---------------------------------------------------------------------
+plot_spec_outcome <- function(df_outcome, main_effect, ylab_txt) {
+  df <- df_outcome %>%
+    dplyr::filter(is.finite(Estimate), is.finite(Std_Error)) %>%
+    dplyr::arrange(Estimate) %>%
+    dplyr::mutate(
+      Significant = P_value < 0.05,
+      MainModel   = abs(Estimate - main_effect) ==
+        min(abs(Estimate - main_effect), na.rm = TRUE)
+    )
+
+  if (nrow(df) == 0L) stop("No rows available for schart().")
+
+  plot_data <- data.frame(
+    Estimate    = df$Estimate,
+    SE          = df$Std_Error,
+    Significant = df$Significant,
+    MainModel   = df$MainModel
+  )
+
+  schart(plot_data)
+  mtext(ylab_txt, side = 2, line = 3.8, cex = 0.95)
+}
+
+op <- par(no.readonly = TRUE)
+par(mfrow = c(1, 2))
+
+plot_spec_outcome(
+  ols_results %>% dplyr::filter(Outcome == "Agricultural expansion"),
+  main_effect_agri,
+  "Change in Agriculture"
+)
+
+plot_spec_outcome(
+  ols_results %>% dplyr::filter(Outcome == "Natural cover loss"),
+  main_effect_nat,
+  "Change in Natural Cover"
+)
+
+par(op)
+
+# ---------------------------------------------------------------------
+# 9. Quick text summary
+# ---------------------------------------------------------------------
+summarise_outcome <- function(df, expected_sign = NULL) {
+  n_total <- nrow(df)
+  n_sig   <- sum(df$P_value < 0.05, na.rm = TRUE)
+  share   <- round(100 * n_sig / max(n_total, 1), 1)
+  rng     <- range(df$Estimate, na.rm = TRUE)
+  n_sig_dir <- if (is.null(expected_sign)) NA_integer_ else
+    sum(df$P_value < 0.05 & sign(df$Estimate) == sign(expected_sign), na.rm = TRUE)
+
+  list(
+    n_total        = n_total,
+    n_sig_5pct     = n_sig,
+    share_sig_5pct = share,
+    range_est      = round(rng, 3),
+    n_sig_in_dir   = n_sig_dir
+  )
+}
+
+agri_sum <- summarise_outcome(
+  ols_results %>% dplyr::filter(Outcome == "Agricultural expansion"),
+  expected_sign = main_effect_agri
+)
+nat_sum <- summarise_outcome(
+  ols_results %>% dplyr::filter(Outcome == "Natural cover loss"),
+  expected_sign = main_effect_nat
+)
+
+message("
+=== Agricultural expansion (spec curve summary) ===")
+print(agri_sum)
+message("
+=== Natural cover loss (spec curve summary) ===")
+print(nat_sum)
+
+# ---------------------------------------------------------------------
+# 10. Specification grid plots
+# ---------------------------------------------------------------------
+balance_summary <- data.frame()
+
+for (name in names(multi_match_results)) {
+  bal <- tryCatch(
+    cobalt::bal.tab(multi_match_results[[name]], un = TRUE),
+    error = function(e) NULL
+  )
+  if (is.null(bal) || is.null(bal$Balance)) next
+
+  balance_summary <- rbind(
+    balance_summary,
+    data.frame(
+      Matching_Set    = name,
+      Mean_SMD_Before = mean(abs(bal$Balance$Diff.Un),  na.rm = TRUE),
+      Mean_SMD_After  = mean(abs(bal$Balance$Diff.Adj), na.rm = TRUE),
+      Max_SMD_After   = max(abs(bal$Balance$Diff.Adj),  na.rm = TRUE)
+    )
+  )
+}
+
+.make_spec_grid_data <- function(ols_results, outcome_label) {
+  df <- ols_results %>%
+    dplyr::filter(Outcome == outcome_label) %>%
+    dplyr::mutate(
+      Method     = sub(".*_(logit|mahalanobis|randomforest)$", "\1", Matching_Set),
+      Covariates = gsub("^covs_|_(logit|mahalanobis|randomforest)$", "", Matching_Set),
+      OLS_Significance = P_value < 0.05
+    ) %>%
+    dplyr::left_join(balance_summary, by = "Matching_Set") %>%
+    dplyr::mutate(
+      balance_tier = dplyr::case_when(
+        is.na(Mean_SMD_After)        ~ "moderate",
+        Mean_SMD_After < 0.10        ~ "very_good",
+        Mean_SMD_After < 0.30        ~ "moderate",
+        TRUE                         ~ "poor"
+      ),
+      balance_very_good = balance_tier == "very_good",
+      balance_moderate  = balance_tier == "moderate",
+      balance_poor      = balance_tier == "poor",
+      Model_ID = dplyr::row_number()
+    )
+
+  spec <- df %>%
+    dplyr::mutate(
+      temperature      = grepl("(^|--)temperature($|--)", Covariates),
+      slope            = grepl("(^|--)slope($|--)", Covariates),
+      accessibility    = grepl("(^|--)accessibility($|--)", Covariates),
+      INCOME           = grepl("(^|--)INCOME($|--)", Covariates),
+      distance_to_road = grepl("(^|--)distance_to_road($|--)", Covariates),
+      logit        = Method == "logit",
+      mahalanobis  = Method == "mahalanobis",
+      randomforest = Method == "randomforest",
+      balance_poor,
+      balance_moderate,
+      balance_very_good,
+      OLS_Significance
+    ) %>%
+    dplyr::select(
+      Model_ID,
+      temperature, slope, accessibility, INCOME, distance_to_road,
+      logit, mahalanobis, randomforest,
+      balance_poor, balance_moderate, balance_very_good,
+      OLS_Significance
+    )
+
+  grid_long <- tidyr::pivot_longer(
+    spec,
+    cols = -Model_ID,
+    names_to = "Feature",
+    values_to = "Included"
+  )
+
+  grid_long <- grid_long %>%
+    dplyr::mutate(
+      Included = factor(Included, levels = c(TRUE, FALSE))
+    )
+
+  grid_long$Feature <- factor(
+    grid_long$Feature,
+    levels = c(
+      "temperature","slope","accessibility","INCOME","distance_to_road",
+      "logit","mahalanobis","randomforest",
+      "balance_poor","balance_moderate","balance_very_good",
+      "OLS_Significance"
+    )
+  )
+
+  list(grid_long = grid_long, model_df = df)
+}
+
+plot_spec_grid <- function(grid_long, title_txt) {
+  ggplot(grid_long, aes(x = factor(Model_ID), y = Feature, color = Included)) +
+    geom_point(size = 3, shape = 16) +
+    scale_color_manual(values = c(`TRUE` = "steelblue", `FALSE` = "grey85"),
+                       guide = "none") +
+    labs(title = title_txt, x = "Model ID", y = "Attributes") +
+    theme_minimal(base_size = 10) +
+    theme(
+      axis.text.x  = element_blank(),
+      axis.ticks.x = element_blank()
+    )
+}
+
+g_agri <- .make_spec_grid_data(ols_results, "Agricultural expansion")
+g_nat  <- .make_spec_grid_data(ols_results, "Natural cover loss")
+
+plot_grid_agri <- plot_spec_grid(
+  g_agri$grid_long,
+  "Specification grid — Agricultural expansion"
+)
+plot_grid_nat <- plot_spec_grid(
+  g_nat$grid_long,
+  "Specification grid — Natural cover loss"
+)
+
+print(plot_grid_agri)
+print(plot_grid_nat)
+
+cat("
+✅ Specification-curve script completed (classical OLS SE only).
+")
