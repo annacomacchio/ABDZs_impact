@@ -1,0 +1,213 @@
+# =====================================================================
+# 07_mean_field_size_matching_spec.R
+# 4-km grid; pick nearest to cell center; multiple matching specs
+#
+# Specs:
+#   - m_nn  : Nearest neighbour (logit PS), no caliper
+#   - m_cal : Nearest neighbour (logit PS), caliper 0.2 SD
+#   - m_mah : Nearest neighbour, Mahalanobis distance
+#
+# Inputs:
+#   - results_80_NEW/patch_metrics_all_clean_with_treatment.gpkg
+#   - OUTER_BUFFER_10km.shp  (optional; used if present)
+#
+# Outputs:
+#   - matched_nearest_MFS_4km.shp / .csv
+#   - matched_caliper_0_2_norepl_MFS_4km.shp / .csv
+#   - matched_mahalanobis_MFS_4km.shp / .csv
+# =====================================================================
+
+library(sf)
+library(dplyr)
+library(MatchIt)
+library(cobalt)
+library(ggplot2)
+library(readr)
+
+set.seed(42)
+
+# ------------------------------
+# 0) Load & prepare data
+# ------------------------------
+in_path  <- "results_80_NEW/patch_metrics_all_clean_with_treatment.gpkg"   # <- adjust if needed
+in_layer <- "patch_metrics_all_clean_with_treatment"                       # <- adjust if needed
+
+g <- sf::st_read(in_path, layer = in_layer, quiet = TRUE)
+
+# Reproject to projected CRS (meters) if currently lon/lat
+if (isTRUE(sf::st_is_longlat(g))) {
+  g <- sf::st_transform(g, 32718)  # UTM 18S; adjust EPSG if needed
+}
+
+# Helper: rename if present
+rename_if_present <- function(df, from, to) {
+  if (from %in% names(df)) {
+    names(df)[names(df) == from] <- to
+  }
+  df
+}
+
+# Standardize covariate names (only if present)
+rename_map <- c(
+  "PRECIPITAT" = "precipitation",
+  "TEMP_MEAN"  = "temperature",
+  "POPDENS_ME" = "population_density",
+  "ELEVATIONM" = "elevation",
+  "SLOPEMEAN"  = "slope",
+  "Hub.distan" = "distance_to_road",
+  "ACCESSIBIL" = "accessibility",
+  "AGRICULTUR" = "crop_2000s",
+  "ing_pc_"    = "income"
+)
+for (k in names(rename_map)) {
+  g <- rename_if_present(g, k, rename_map[[k]])
+}
+
+covariates_all <- c(
+  "precipitation","temperature","population_density","elevation",
+  "slope","distance_to_road","accessibility","crop_2000s","income",
+  "mean_patch_size_ha_2000"
+)
+covariates <- intersect(covariates_all, names(g))
+if (length(covariates) == 0L) {
+  stop("No covariates found. Check names present in the file/layer.")
+}
+
+# Coerce TREATMENT to 0/1
+to_int01 <- function(x){
+  if (is.factor(x)) x <- as.character(x)
+  if (is.character(x)) {
+    xl <- tolower(trimws(x))
+    x <- ifelse(
+      xl %in% c("1","true","t","yes","y","treated","treatment"), 1L,
+      ifelse(xl %in% c("0","false","f","no","n","control"), 0L, NA_integer_)
+    )
+  }
+  if (is.logical(x)) x <- as.integer(x)
+  if (is.numeric(x)) x <- as.integer(x != 0 & !is.na(x))
+  as.integer(x)
+}
+
+stopifnot("TREATMENT" %in% names(g))
+g$TREATMENT <- to_int01(g$TREATMENT)
+
+# Ensure ID exists
+if (!"ID" %in% names(g)) {
+  g$ID <- seq_len(nrow(g))
+}
+
+cat("Loaded rows:", nrow(g), " | columns:", ncol(g), "\n")
+
+# ------------------------------
+# 1) Remove cells intersecting OUTER_BUFFER_10km (if available)
+# ------------------------------
+outer_buffer_path <- "OUTER_BUFFER_10km.shp"
+
+if (file.exists(outer_buffer_path)) {
+  outer10 <- sf::st_read(outer_buffer_path, quiet = TRUE) |>
+    sf::st_transform(sf::st_crs(g)) |>
+    sf::st_make_valid()
+  outer10_u <- sf::st_union(outer10)
+
+  n0   <- nrow(g)
+  hits <- lengths(sf::st_intersects(g, outer10_u)) > 0L
+  g    <- g[!hits, ]
+  message(
+    "Removed ", n0 - nrow(g),
+    " cells intersecting OUTER_BUFFER_10km; kept ", nrow(g), "."
+  )
+} else {
+  warning("outer_buffer_path not found: ", outer_buffer_path, " — skipping buffer removal.")
+}
+
+# -----------------------------
+# 2) Keep ONLY “full” pixels & thin to one per 4-km lattice cell
+# -----------------------------
+spacing_m          <- 4000   # 4-km grid
+min_pixel_fullness <- 0.99   # keep pixels >= 99% of a “full” pixel
+
+# Estimate “full” pixel area from data
+pixel_area_full <- stats::median(as.numeric(sf::st_area(g)), na.rm = TRUE)
+
+g <- g |>
+  mutate(
+    pixel_area_m2  = as.numeric(sf::st_area(geometry)),
+    pixel_fullness = pmin(pixel_area_m2 / pixel_area_full, 1)
+  ) |>
+  filter(pixel_fullness >= min_pixel_fullness)
+
+# Build stable 4-km lattice aligned to extent and sample nearest to lattice center
+cent <- sf::st_centroid(g)
+xy   <- sf::st_coordinates(cent)
+
+g <- g %>%
+  mutate(
+    x_coord = xy[, 1],
+    y_coord = xy[, 2]
+  )
+
+x0    <- min(g$x_coord, na.rm = TRUE)
+y0    <- min(g$y_coord, na.rm = TRUE)
+x_off <- x0 %% spacing_m
+y_off <- y0 %% spacing_m
+
+g <- g %>%
+  mutate(
+    cell_x = floor((x_coord - x_off) / spacing_m),
+    cell_y = floor((y_coord - y_off) / spacing_m)
+  )
+
+sample_4km_nearest_center <- function(df) {
+  df %>%
+    group_by(cell_x, cell_y) %>%
+    mutate(
+      cx = cell_x * spacing_m + spacing_m / 2 + x_off,
+      cy = cell_y * spacing_m + spacing_m / 2 + y_off,
+      d2 = (x_coord - cx)^2 + (y_coord - cy)^2
+    ) %>%
+    arrange(d2, .by_group = TRUE) %>%
+    slice(1) %>%
+    ungroup() %>%
+    select(-cx, -cy, -d2)
+}
+
+sf_per_cell_4km <- sample_4km_nearest_center(g)
+
+message(
+  "After 4-km thinning (one per cell, full pixels only): n = ",
+  nrow(sf_per_cell_4km)
+)
+
+stopifnot(
+  nrow(
+    sf_per_cell_4km %>%
+      count(cell_x, cell_y) %>%
+      filter(n > 1L)
+  ) == 0L
+)
+
+# ------------------------------
+# 3) Prep data for matching
+# ------------------------------
+g_use <- sf_per_cell_4km
+
+df_all <- sf::st_drop_geometry(g_use) %>%
+  filter(!is.na(TREATMENT)) %>%
+  filter(if_all(all_of(covariates), ~ !is.na(.)))
+
+cat("After NA filtering for covariates + treatment:", nrow(df_all), "rows\n")
+
+# ------------------------------
+# 4) Matching specifications
+# ------------------------------
+form <- as.formula(paste("TREATMENT ~", paste(covariates, collapse = " + ")))
+
+# (A) Nearest neighbour (logit PS), no caliper
+m_nn <- MatchIt::matchit(
+  formula  = form,
+  data     = df_all,
+  method   = "nearest",
+  distance = "logit",
+  replace  = FALSE,
+  ratio    = 1
+)
