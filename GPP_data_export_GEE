@@ -1,0 +1,142 @@
+// ============================
+// GPP over cropland + cropland fraction per polygon
+// ============================
+
+// ----------------------------
+// Inputs: polygons
+// ----------------------------
+var polygons = ee.FeatureCollection(
+  'projects/ee-annacomacchio93/assets/COV_ALL_NO_COTAHUASI'
+);
+
+// Attach stable IDs
+var polygonsWithID = polygons.map(function (f) {
+  return f.set({
+    uid: f.id(),
+    ID: f.get('ID')
+  });
+});
+
+// ----------------------------
+// Land cover mask (MapBiomas Peru C2): cropland = 18, 21
+// ----------------------------
+function getCroplandMask(year) {
+  year = ee.Number(year).toInt();
+  var bandName = ee.String('classification_').cat(year.format());
+  var lc = ee.Image(
+    'projects/mapbiomas-public/assets/peru/collection2/mapbiomas_peru_collection2_integration_v1'
+  )
+    .select(bandName)
+    .rename('classification');
+
+  return lc.eq(18).or(lc.eq(21)).selfMask();
+}
+
+// ----------------------------
+// Extract annual GPP mean over cropland per polygon
+// + area-weighted cropland fraction per polygon
+//
+// - GPP_<year>: mean GPP over cropland pixels
+//               "NA" (string) if polygon has zero cropland pixels
+// - CROP_FRAC_<year>: cropland area / total polygon area  [0–1], NA if total area = 0
+// ----------------------------
+function extractGPPYear(fc, year) {
+  var yearNum = ee.Number(year).toInt();
+  var outGPP  = 'GPP_' + year;
+  var outFrac = 'CROP_FRAC_' + year;
+
+  var start = ee.Date.fromYMD(yearNum, 1, 1);
+  var end   = start.advance(1, 'year'); // exclusive
+
+  // MOD17A2HGF 8-day GPP (kg C m-2 8-day); scale factor 0.0001
+  var gppAnnual = ee.ImageCollection('MODIS/061/MOD17A2HGF')
+    .filterDate(start, end)
+    .select('Gpp')
+    .sum()
+    .multiply(0.0001);
+
+  // Land-cover-based cropland mask for that year
+  var cropMask = getCroplandMask(yearNum);
+
+  // GPP only on cropland
+  var gppMasked = gppAnnual.updateMask(cropMask).rename('gpp');
+
+  // Area rasters (m²)
+  // - cropland area (masked by cropland)
+  // - total polygon area (no mask: full polygon footprint)
+  var cropArea  = ee.Image.pixelArea().updateMask(cropMask).rename('cropArea');
+  var totalArea = ee.Image.pixelArea().rename('totalArea');
+
+  // Stack bands so we can reduce once:
+  //   gpp:       mean, count
+  //   cropArea:  sum
+  //   totalArea: sum
+  var stack = gppMasked.addBands(cropArea).addBands(totalArea);
+
+  var reducer = ee.Reducer.mean()        // gpp_mean, cropArea_mean, totalArea_mean
+    .combine({
+      reducer2: ee.Reducer.count(),      // gpp_count, cropArea_count, totalArea_count
+      sharedInputs: true
+    })
+    .combine({
+      reducer2: ee.Reducer.sum(),        // gpp_sum, cropArea_sum, totalArea_sum
+      sharedInputs: true
+    });
+
+  var reduced = stack.reduceRegions({
+    collection: fc,
+    reducer: reducer,
+    scale: 500,
+    tileScale: 8
+  });
+
+  // Post-process:
+  // - GPP_<year> = mean GPP over cropland; "NA" if no cropland pixels
+  // - CROP_FRAC_<year> = cropArea_sum / totalArea_sum
+  reduced = reduced.map(function (feat) {
+    var gppCount = ee.Number(feat.get('gpp_count'));
+    var gppMean  = feat.get('gpp_mean');
+
+    var cropAreaSum  = ee.Number(feat.get('cropArea_sum'));
+    var totalAreaSum = ee.Number(feat.get('totalArea_sum'));
+
+    var gppVal = ee.Algorithms.If(
+      gppCount.gt(0),
+      gppMean,
+      'NA'  // explicitly mark polygons without cropland
+    );
+
+    var frac = ee.Algorithms.If(
+      totalAreaSum.gt(0),
+      cropAreaSum.divide(totalAreaSum),
+      null
+    );
+
+    return feat
+      .set(outGPP, gppVal)
+      .set(outFrac, frac)
+      .set('ID', feat.get('ID'))
+      .set('uid', feat.get('uid'))
+      .select(['ID', 'uid', outGPP, outFrac]);
+  });
+
+  return reduced;
+}
+
+// ----------------------------
+// Example: run for one year
+// ----------------------------
+var targetYear = 2013;
+var result = extractGPPYear(polygonsWithID, targetYear);
+print('Sample result', result.limit(5));
+
+// ----------------------------
+// Export to Drive (CSV)
+// ----------------------------
+Export.table.toDrive({
+  collection: result,
+  description: 'GPP_' + targetYear + '_with_cropland_fraction',
+  folder: 'GPP_exports',
+  fileNamePrefix: 'GPP_' + targetYear + '_with_cropland_fraction',
+  fileFormat: 'CSV'
+});
