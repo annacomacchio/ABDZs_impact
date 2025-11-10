@@ -1,0 +1,101 @@
+# --- 1. Load packages
+library(terra)
+library(sf)
+library(dplyr)
+library(ggfortify)
+library(factoextra)
+
+# --- 2. Load vector data
+abdz     <- st_read("PCA/treatment_buffer_5km.shp")
+cropland <- st_read("PCA/superficie agricola/superficie_agr.shp")
+
+# --- 3. Load environmental rasters
+temperature   <- rast("PCA/processed/bio2_1km.tif")
+precipitation <- rast("PCA/processed/bio12_1km.tif")
+radiation     <- rast("PCA/processed/radiation_1km.tif")
+elevation     <- rast("PCA/processed/elevation_1km.tif")
+slope         <- rast("PCA/processed/slope_1km.tif")
+swb           <- rast("PCA/processed/swb_1km.tif")
+humidity      <- rast("PCA/processed/humidity_1km.tif")
+gsl           <- rast("PCA/processed/gsl_1km.tif")
+
+env_stack <- c(temperature, precipitation, radiation, elevation, slope, swb, humidity, gsl)
+names(env_stack) <- c("temperature", "precipitation", "radiation", "elevation", 
+                      "slope", "swb", "humidity", "gsl")
+
+# --- 4. Reproject vector data
+ref_crs <- crs(env_stack)
+abdz     <- st_transform(abdz, ref_crs)
+cropland <- st_transform(cropland, ref_crs)
+abdz_vect     <- vect(abdz)
+cropland_vect <- vect(cropland)
+
+# --- 5. Create control area: cropland - ABDZ
+ref <- precipitation
+cropland_rast <- rasterize(cropland_vect, ref, field = 1)
+abdz_rast     <- rasterize(abdz_vect, ref, field = 1)
+control_area  <- mask(cropland_rast, abdz_rast, inverse = TRUE)
+
+# --- 6. Extract environmental values from ABDZ and control areas
+abdz_env    <- mask(crop(env_stack, abdz_vect), abdz_vect)
+control_env <- mask(env_stack, control_area)
+
+# --- 7. Sample points
+set.seed(123)
+valid_cells <- which(!is.na(values(control_area)))
+sample_ids  <- sample(valid_cells, size = 10000)
+sample_xy   <- xyFromCell(control_area, sample_ids)
+control_pts_sf <- st_as_sf(data.frame(sample_xy), coords = c("x", "y"), crs = crs(control_area))
+control_values <- terra::extract(env_stack, vect(control_pts_sf))
+control_values$Group <- "Other Cropland"
+control_values <- control_values[complete.cases(control_values), ]
+control_values <- control_values[, names(control_values) != "ID"]
+
+# Sample from ABDZ
+abdz_pts <- spatSample(abdz_env, size = 1000, method = "random", as.points = TRUE, na.rm = TRUE)
+abdz_pts$Group <- "ABDZs"
+abdz_df <- as.data.frame(abdz_pts)
+
+# --- 8. Combine data
+all_env_df <- rbind(abdz_df, control_values)
+
+# --- 9. Log-transform selected variables (keep temperature & swb untransformed)
+env_vars <- all_env_df[, c("temperature", "precipitation", "radiation", 
+                           "elevation", "slope", "swb", "humidity", "gsl")]
+
+env_vars_log <- env_vars %>%
+  mutate(
+    precipitation = log(precipitation + 1),
+    radiation     = log(radiation + 1),
+    elevation     = log(elevation + 1),
+    slope         = log(slope + 1),
+    humidity      = log(humidity + 1),
+    gsl           = log(gsl + 1)
+  )
+
+# --- 10. PCA
+pca_result <- prcomp(env_vars_log, scale. = TRUE)
+
+# --- 11. Visualizations
+
+
+# factoextra 
+fviz_pca_biplot(pca_result,
+                geom.ind = "point",
+                col.ind = all_env_df$Group,
+                palette = c("darkgreen", "blue"),
+                addEllipses = TRUE,
+                label = "var",
+                repel = TRUE,
+                title = "Environmental PCA: ABDZs vs Other Cropland")
+
+# --- 12. Save scores
+scores <- as.data.frame(pca_result$x)
+env_pca <- cbind(all_env_df, scores)
+write.csv(env_pca, "PCA_scores_ABDZs_vs_Other_Cropland.csv", row.names = FALSE)
+
+# --- 13. (Optional) Project scores to raster
+pca_scores <- predict(env_stack, pca_result, index = 1:2)
+pca_scores_peru <- mask(pca_scores, cropland_rast)
+plot(pca_scores_peru[[1]], main = "PC1 Score Map")
+plot(pca_scores_peru[[2]], main = "PC2 Score Map")
