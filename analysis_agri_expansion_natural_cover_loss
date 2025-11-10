@@ -1,0 +1,606 @@
+# =========================================================
+# Script name: analysis_agri_expansion_natural_cover_loss.R
+# Project:     ABDZs_impact
+#
+# Purpose:
+#   Use 1:1 matched ABDZ vs control pairs to:
+#     - Estimate treatment effects (OLS with HC1 SEs, ATT, ATE)
+#     - Summarize outcomes: agri_expansion, natural_cover_loss
+#     - Plot aggregated outcomes and class-level land cover changes
+#     - Conduct mediation analysis:
+#           TREATMENT -> agri_expansion -> natural_cover_loss
+#     - Run sensitivity analysis (sensemakr)
+#     - Scale effects from percentage points to total hectares
+#
+# Input:
+#   - Matched shapefile:
+#       matched_caliper_4km_NO_COTA_NO_10KM.shp
+#
+# Outputs (printed / plotted in R session):
+#   - Summary table of treatment effects (console)
+#   - Land cover class change plot (Treatment vs Control)
+#   - Aggregated outcome plot with significance annotations
+#   - Combined figure (two-panel)
+#   - Mediation analysis summary
+#   - Sensemakr sensitivity summary
+#   - Scaled ATT/ATE in hectares (console)
+#
+# Notes:
+#   - Edit 'infile' if using a different matched dataset.
+#   - Assumes agri_expansion & natural_cover_loss are in percentage points.
+# =========================================================
+
+# ---- 0) Libraries ----
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(sf)
+  library(sandwich)
+  library(lmtest)
+  library(marginaleffects)
+  library(ggplot2)
+  library(patchwork)
+  library(purrr)
+  library(mediation)
+  library(sensemakr)
+  library(gstat)        # for variograms if needed
+  library(rlang)
+})
+
+set.seed(42)
+
+# ---- 1) Load data (edit path if needed) ----
+infile <- "matched_caliper_4km_NO_COTA_NO_10KM.shp"
+stopifnot(file.exists(infile))
+matched <- sf::st_read(infile, quiet = TRUE)
+
+# ---- 2) Ensure projected CRS (meters). Auto-pick UTM if lon/lat ----
+to_utm_if_needed <- function(sfobj){
+  crs <- sf::st_crs(sfobj)
+  if (is.na(crs)) {
+    message("No CRS found; assuming WGS84 (EPSG:4326) before UTM transform.")
+    sfobj <- sf::st_set_crs(sfobj, 4326)
+    crs <- sf::st_crs(sfobj)
+  }
+  if (isTRUE(sf::st_is_longlat(crs))) {
+    bb  <- sf::st_bbox(sfobj)
+    lon <- mean(c(bb["xmin"], bb["xmax"]), na.rm = TRUE)
+    lat <- mean(c(bb["ymin"], bb["ymax"]), na.rm = TRUE)
+    zone <- floor((lon + 180) / 6) + 1
+    epsg <- if (lat >= 0) 32600 + zone else 32700 + zone
+    message("Transforming to UTM (EPSG: ", epsg, ")")
+    sf::st_transform(sfobj, epsg)
+  } else {
+    sfobj
+  }
+}
+matched <- to_utm_if_needed(matched)
+
+# ---- 3) Robust renaming (rename only if present) ----
+rename_if_present <- function(df, mapping) {
+  for (new in names(mapping)) {
+    old <- mapping[[new]]
+    if (old %in% names(df)) {
+      df <- dplyr::rename(df, !!new := !!rlang::sym(old))
+    }
+  }
+  df
+}
+
+matched <- matched %>% rename_if_present(c(
+  TREATMENT           = "TREATME",
+  ACCESSIBILITY       = "accssbl",
+  ELEVATION           = "elevatn",
+  SLOPE               = "slope",
+  PRECIPITATION       = "prcpttn",
+  AGRICULTURE_2000    = "Ag_2000",
+  OTHER_NON_VEG_2000  = "OTHER_NON_",
+  FOREST_2000         = "Fr_2000",
+  GRASSLAND_2000      = "Gr_2000",
+  MINING_2000         = "MINING_200",
+  AGRICULTURE_2022    = "AGRICULTU2",
+  OTHER_NON_VEG_2022  = "OTHER_NON2",
+  FOREST_2022         = "FOREST_",
+  GRASSLAND_2022      = "GRASSLA",
+  MINING_2022         = "MINING_202",
+  agri_expansion      = "agr_xpn",
+  natural_cover_loss  = "NATURAL",
+  TEMPERATURE         = "temprtr",
+  POP_DENSITY         = "ppltn_d",
+  DISTANCE_TO_ROAD    = "dstnc__",
+  subclass            = "subclss",
+  INCOME              = "INCOME"
+))
+
+}
+
+# ---- 4) Keep only perfectly 1:1 matched subclasses & align pairs ----
+pair_counts <- matched %>%
+  st_drop_geometry() %>%
+  count(subclass, TREATMENT, name = "n") %>%
+  tidyr::pivot_wider(
+    names_from  = TREATMENT,
+    values_from = n,
+    values_fill = 0,
+    names_prefix = "T"
+  ) %>%
+  mutate(is_1to1 = (T0 == 1 & T1 == 1))
+
+valid_pairs <- pair_counts %>%
+  filter(is_1to1) %>%
+  pull(subclass)
+
+matched_pair <- matched %>%
+  filter(subclass %in% valid_pairs) %>%
+  arrange(subclass, TREATMENT)
+
+treated <- matched_pair %>% filter(TREATMENT == 1)
+control <- matched_pair %>% filter(TREATMENT == 0)
+
+if (nrow(treated) == 0L) stop("No 1:1 pairs found. Check 'subclass' pairing.")
+stopifnot(nrow(treated) == nrow(control))
+stopifnot(identical(
+  st_drop_geometry(treated)$subclass,
+  st_drop_geometry(control)$subclass
+))
+
+message(
+  "Pairs retained: ",
+  dplyr::n_distinct(st_drop_geometry(treated)$subclass),
+  " | N per arm: ", nrow(treated)
+)
+
+# ---- 5) Helper functions ----
+star <- function(p) {
+  if (is.na(p)) return("")
+  if (p < 0.001) return("***")
+  if (p < 0.01)  return("**")
+  if (p < 0.05)  return("*")
+  "n.s."
+}
+
+summary_stats <- function(x) {
+  x <- x[is.finite(x)]
+  n <- length(x)
+  m <- mean(x)
+  if (n > 1) {
+    se <- stats::sd(x) / sqrt(n)
+    ci <- m + qt(c(0.025, 0.975), df = n - 1) * se
+  } else {
+    ci <- c(NA_real_, NA_real_)
+  }
+  c(mean = m, lower = ci[1], upper = ci[2])
+}
+
+# ---- 6) Absolute means (Treatment vs Control) ----
+agri_mean_t <- mean(treated$agri_expansion, na.rm = TRUE)
+agri_mean_c <- mean(control$agri_expansion, na.rm = TRUE)
+nat_mean_t  <- mean(treated$natural_cover_loss, na.rm = TRUE)
+nat_mean_c  <- mean(control$natural_cover_loss, na.rm = TRUE)
+
+# ---- 7) OLS for both outcomes + HC1 robust SE ----
+covars <- c(
+  "PRECIPITATION", "TEMPERATURE", "POP_DENSITY",
+  "ACCESSIBILITY", "ELEVATION", "SLOPE", "DISTANCE_TO_ROAD",
+  "FOREST_2000", "GRASSLAND_2000", "AGRICULTURE_2000", "INCOME"
+)
+
+covars_present <- intersect(covars, names(matched_pair))
+model_vars <- c("agri_expansion", "natural_cover_loss", "TREATMENT", covars_present)
+
+analysis_df <- matched_pair %>%
+  st_drop_geometry() %>%
+  dplyr::select(dplyr::any_of(model_vars)) %>%
+  dplyr::filter(complete.cases(dplyr::across(dplyr::all_of(model_vars))))
+
+stopifnot(nrow(analysis_df) > 0)
+
+rhs    <- if (length(covars_present)) {
+  paste(c("TREATMENT", covars_present), collapse = " + ")
+} else {
+  "TREATMENT"
+}
+
+f_agri <- stats::as.formula(paste("agri_expansion ~", rhs))
+f_nat  <- stats::as.formula(paste("natural_cover_loss ~", rhs))
+
+ols_agri <- lm(f_agri, data = analysis_df)
+ols_nat  <- lm(f_nat,  data = analysis_df)
+
+ct_agri <- coeftest(ols_agri, vcov = sandwich::vcovHC(ols_agri, type = "HC1"))
+ct_nat  <- coeftest(ols_nat,  vcov = sandwich::vcovHC(ols_nat,  type = "HC1"))
+
+pull_treat <- function(ct) {
+  rn <- rownames(ct)
+  stopifnot("TREATMENT" %in% rn)
+  c(
+    Estimate = unname(ct["TREATMENT", "Estimate"]),
+    SE       = unname(ct["TREATMENT", "Std. Error"]),
+    t        = unname(ct["TREATMENT", "t value"]),
+    Pvalue   = unname(ct["TREATMENT", "Pr(>|t|)"])
+  )
+}
+
+ols_agri_vals <- pull_treat(ct_agri)
+ols_nat_vals  <- pull_treat(ct_nat)
+
+# ---- 8) ATT & ATE (avg_comparisons, from marginaleffects) ----
+att_agri <- avg_comparisons(
+  ols_agri,
+  variables = "TREATMENT",
+  newdata   = subset(analysis_df, TREATMENT == 1)
+)
+
+ate_agri <- avg_comparisons(
+  ols_agri,
+  variables = "TREATMENT"
+)
+
+att_nat <- avg_comparisons(
+  ols_nat,
+  variables = "TREATMENT",
+  newdata   = subset(analysis_df, TREATMENT == 1)
+)
+
+ate_nat <- avg_comparisons(
+  ols_nat,
+  variables = "TREATMENT"
+)
+
+att_agri_df <- as.data.frame(att_agri)
+ate_agri_df <- as.data.frame(ate_agri)
+att_nat_df  <- as.data.frame(att_nat)
+ate_nat_df  <- as.data.frame(ate_nat)
+
+# ---- 9) Unified summary table (OLS + ATT/ATE) ----
+summary_tbl <- tibble::tibble(
+  Outcome                  = c("Agricultural Expansion", "Natural Cover Loss"),
+  `Treatment mean`         = c(agri_mean_t, nat_mean_t),
+  `Control mean`           = c(agri_mean_c, nat_mean_c),
+  `OLS coef (Treat) [HC1]` = c(ols_agri_vals["Estimate"], ols_nat_vals["Estimate"]),
+  `OLS p (Treat) [HC1]`    = c(ols_agri_vals["Pvalue"],  ols_nat_vals["Pvalue"]),
+  `OLS sig`                = c(star(ols_agri_vals["Pvalue"]), star(ols_nat_vals["Pvalue"])),
+  `ATT (avg_comp)`         = c(att_agri_df$estimate[1], att_nat_df$estimate[1]),
+  `ATT p`                  = c(att_agri_df$p.value[1],  att_nat_df$p.value[1]),
+  `ATT sig`                = c(star(att_agri_df$p.value[1]), star(att_nat_df$p.value[1])),
+  `ATE (avg_comp)`         = c(ate_agri_df$estimate[1], ate_nat_df$estimate[1]),
+  `ATE p`                  = c(ate_agri_df$p.value[1],  ate_nat_df$p.value[1]),
+  `ATE sig`                = c(star(ate_agri_df$p.value[1]), star(ate_nat_df$p.value[1]))
+)
+
+print(
+  dplyr::mutate(
+    summary_tbl,
+    dplyr::across(where(is.numeric), ~ round(.x, 4))
+  ),
+  n = Inf, width = Inf
+)
+
+# ============================================================
+# 10) Class-level changes (2022–2000) by group (descriptive)
+# ============================================================
+
+land_classes <- c("AGRICULTURE", "GRASSLAND", "FOREST", "OTHER_NON_VEG", "MINING")
+
+get_stats_by_class <- function(df, group_name) {
+  out <- lapply(land_classes, function(lc) {
+    c0 <- paste0(lc, "_2000")
+    c1 <- paste0(lc, "_2022")
+    if (!all(c(c0, c1) %in% names(df))) return(NULL)
+    change <- suppressWarnings(as.numeric(df[[c1]]) - as.numeric(df[[c0]]))
+    s <- summary_stats(change)
+    data.frame(
+      LandCover = lc,
+      Group     = group_name,
+      Mean      = s["mean"],
+      Lower     = s["lower"],
+      Upper     = s["upper"],
+      stringsAsFactors = FALSE
+    )
+  })
+  dplyr::bind_rows(out)
+}
+
+plot_df <- dplyr::bind_rows(
+  get_stats_by_class(treated, "Treatment"),
+  get_stats_by_class(control, "Control")
+) %>%
+  dplyr::filter(is.finite(Mean) | is.finite(Lower) | is.finite(Upper))
+
+land_colors <- c(
+  "AGRICULTURE"   = "#FFD700",
+  "GRASSLAND"     = "#90EE90",
+  "FOREST"        = "#006400",
+  "MINING"        = "#800080",
+  "OTHER_NON_VEG" = "#FFA500"
+)
+
+plot_lc <- ggplot(plot_df, aes(x = LandCover, y = Mean, fill = LandCover)) +
+  geom_col(
+    position = position_dodge2(width = 0.7, preserve = "single"),
+    aes(group = Group),
+    width = 0.6
+  ) +
+  geom_errorbar(
+    aes(ymin = Lower, ymax = Upper),
+    width = 0.2,
+    position = position_dodge2(width = 0.7, preserve = "single")
+  ) +
+  facet_wrap(~ Group) +
+  scale_fill_manual(values = land_colors) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(y = "Change (%)", x = NULL) +
+  theme_light(base_size = 13) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    legend.position    = "none",
+    strip.text         = element_text(face = "bold"),
+    axis.text.x        = element_text(angle = 20, hjust = 1)
+  )
+
+# ============================================================
+# 11) Aggregated outcomes: Treatment vs Control (means + 95% CI)
+# ============================================================
+
+summary_stats_bar <- function(x) {
+  x <- x[is.finite(x)]
+  n <- length(x)
+  if (n == 0) return(c(mean = NA_real_, lower = NA_real_, upper = NA_real_))
+  m  <- mean(x)
+  se <- stats::sd(x) / sqrt(n)
+  ci <- 1.96 * se
+  c(mean = m, lower = m - ci, upper = m + ci)
+}
+
+treated_agri  <- summary_stats_bar(treated$agri_expansion)
+control_agri  <- summary_stats_bar(control$agri_expansion)
+treated_nat   <- summary_stats_bar(treated$natural_cover_loss)
+control_nat   <- summary_stats_bar(control$natural_cover_loss)
+
+summary_df <- data.frame(
+  Group   = rep(c("Treatment", "Control"), times = 2),
+  Outcome = rep(c("Agricultural Expansion", "Natural Cover Loss"), each = 2),
+  Mean    = c(
+    treated_agri["mean"],  control_agri["mean"],
+    treated_nat["mean"],   control_nat["mean"]
+  ),
+  Lower   = c(
+    treated_agri["lower"], control_agri["lower"],
+    treated_nat["lower"],  control_nat["lower"]
+  ),
+  Upper   = c(
+    treated_agri["upper"], control_agri["upper"],
+    treated_nat["upper"],  control_nat["upper"]
+  )
+)
+
+summary_df$Group <- factor(summary_df$Group, levels = c("Control", "Treatment"))
+
+p_agri <- as.numeric(ols_agri_vals["Pvalue"])
+p_nat  <- as.numeric(ols_nat_vals["Pvalue"])
+
+get_sig_label <- function(p) {
+  if (is.na(p))      "n.s."
+  else if (p < 0.001) "***"
+  else if (p < 0.01)  "**"
+  else if (p < 0.05)  "*"
+  else               "n.s."
+}
+
+facet_stats <- summary_df %>%
+  dplyr::group_by(Outcome) %>%
+  dplyr::summarise(
+    y_top = max(Upper, na.rm = TRUE),
+    y_min = min(Lower, na.rm = TRUE),
+    y_rng = max(Upper, na.rm = TRUE) - min(Lower, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    pad   = ifelse(is.finite(y_rng) & y_rng > 0,
+                   0.08 * y_rng,
+                   0.1 * (abs(y_top) + 1)),
+    y_pos = y_top + pad,
+    y_seg = y_pos - ifelse(is.finite(y_rng) & y_rng > 0,
+                           0.03 * y_rng,
+                           0.05 * (abs(y_top) + 1))
+  )
+
+sig_labels <- tibble::tibble(
+  Outcome = c("Agricultural Expansion", "Natural Cover Loss"),
+  p_value = c(p_agri, p_nat),
+  label   = c(get_sig_label(p_agri), get_sig_label(p_nat))
+) %>%
+  dplyr::left_join(facet_stats, by = "Outcome")
+
+plot_agg <- ggplot(summary_df, aes(x = Group, y = Mean, fill = Group)) +
+  geom_col(width = 0.6) +
+  geom_errorbar(aes(ymin = Lower, ymax = Upper), width = 0.2) +
+  facet_wrap(~ Outcome, scales = "free_y") +
+  scale_fill_manual(values = c("Control" = "grey60", "Treatment" = "forestgreen")) +
+  geom_text(
+    data = sig_labels,
+    aes(x = 1.5, y = y_pos, label = label),
+    inherit.aes = FALSE,
+    size = 5,
+    fontface = "bold"
+  ) +
+  geom_segment(
+    data = sig_labels,
+    aes(x = 1, xend = 2, y = y_seg, yend = y_seg),
+    inherit.aes = FALSE,
+    linewidth = 0.5
+  ) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(x = NULL, y = "Change (%)") +
+  theme_minimal(base_size = 13) +
+  theme(
+    strip.text   = element_text(face = "bold"),
+    axis.text.x  = element_text(angle = 10, hjust = 1),
+    legend.position = "none",
+    plot.margin  = margin(t = 18, r = 12, b = 8, l = 12)
+  ) +
+  coord_cartesian(clip = "off")
+
+# ============================================================
+# 12) Mediation analysis: TREATMENT -> agri_expansion -> natural_cover_loss
+# ============================================================
+
+all_covars <- covars
+present_covars <- intersect(all_covars, names(matched_pair))
+needed <- c("TREATMENT", "agri_expansion", "natural_cover_loss", present_covars)
+
+med_df <- matched_pair %>%
+  sf::st_drop_geometry() %>%
+  dplyr::select(dplyr::any_of(needed)) %>%
+  dplyr::filter(complete.cases(dplyr::across(dplyr::all_of(needed))))
+
+rhs_covars <- if (length(present_covars)) {
+  paste(present_covars, collapse = " + ")
+} else {
+  "1"
+}
+
+f_med <- stats::as.formula(paste("agri_expansion ~ TREATMENT +", rhs_covars))
+mediator_model <- lm(f_med, data = med_df)
+
+f_out <- stats::as.formula(
+  paste("natural_cover_loss ~ TREATMENT + agri_expansion +", rhs_covars)
+)
+outcome_model <- lm(f_out, data = med_df)
+
+set.seed(42)
+med_results <- mediate(
+  model.m  = mediator_model,
+  model.y  = outcome_model,
+  treat    = "TREATMENT",
+  mediator = "agri_expansion",
+  sims     = 1000,
+  robustSE = TRUE
+)
+
+print(summary(med_results))
+
+# ============================================================
+# 13) Sensemakr sensitivity (TEMPERATURE benchmark)
+# ============================================================
+
+bench_mult <- c(1, 2, 3, 5, 7, 9)
+
+sens <- sensemakr(
+  model                = ols_nat,
+  treatment            = "TREATMENT",
+  benchmark_covariates = intersect(
+    c("ACCESSIBILITY", "TEMPERATURE"),
+    names(analysis_df)
+  ),
+  kd = bench_mult,
+  ky = bench_mult
+)
+
+print(summary(sens))
+
+print(
+  robustness_value(
+    model      = ols_nat,
+    covariates = "TREATMENT",
+    q          = 1,
+    alpha      = 0.05
+  )
+)
+
+# ============================================================
+# 14) Final combined figure (panel a: aggregated, panel b: classes)
+# ============================================================
+
+plot_agg_titled <- plot_agg +
+  ggtitle("a) Land use change") +
+  theme(
+    plot.title          = element_text(size = 12, face = "plain", hjust = 0),
+    plot.title.position = "plot",
+    plot.margin         = margin(t = 12, r = 8, b = 6, l = 8)
+  )
+
+plot_lc_titled <- plot_lc +
+  ggtitle("b) Class-level change") +
+  theme(
+    plot.title          = element_text(size = 12, face = "plain", hjust = 0),
+    plot.title.position = "plot",
+    plot.margin         = margin(t = 12, r = 8, b = 6, l = 8)
+  )
+
+combined_plot <- plot_agg_titled / plot_lc_titled +
+  patchwork::plot_layout(guides = "collect")
+
+print(combined_plot)
+
+# ============================================================
+# 15) Scale treatment effects to hectares over the whole area
+# ============================================================
+
+total_area_ha <- 239233.83  # total area in hectares (specify in README)
+
+# Recompute avg_comparisons with 95% CIs for scaling
+att_agri <- avg_comparisons(
+  ols_agri,
+  variables = "TREATMENT",
+  newdata   = subset(analysis_df, TREATMENT == 1),
+  conf_level = 0.95
+)
+ate_agri <- avg_comparisons(
+  ols_agri,
+  variables = "TREATMENT",
+  conf_level = 0.95
+)
+att_nat <- avg_comparisons(
+  ols_nat,
+  variables = "TREATMENT",
+  newdata   = subset(analysis_df, TREATMENT == 1),
+  conf_level = 0.95
+)
+ate_nat <- avg_comparisons(
+  ols_nat,
+  variables = "TREATMENT",
+  conf_level = 0.95
+)
+
+scale_to_ha <- function(df_row, area_ha) {
+  pct_to_ha <- function(x) (x / 100) * area_ha
+  data.frame(
+    estimate_pp = df_row$estimate,
+    conf_low_pp = df_row$conf.low,
+    conf_high_pp = df_row$conf.high,
+    estimate_ha = pct_to_ha(df_row$estimate),
+    conf_low_ha = pct_to_ha(df_row$conf.low),
+    conf_high_ha = pct_to_ha(df_row$conf.high),
+    p_value      = df_row$p.value
+  )
+}
+
+scaled_tbl <- dplyr::bind_rows(
+  cbind(
+    Outcome = "Agricultural Expansion",
+    Type    = "ATT",
+    scale_to_ha(as.data.frame(att_agri)[1, ], total_area_ha)
+  ),
+  cbind(
+    Outcome = "Agricultural Expansion",
+    Type    = "ATE",
+    scale_to_ha(as.data.frame(ate_agri)[1, ], total_area_ha)
+  ),
+  cbind(
+    Outcome = "Natural Cover Loss",
+    Type    = "ATT",
+    scale_to_ha(as.data.frame(att_nat)[1, ], total_area_ha)
+  ),
+  cbind(
+    Outcome = "Natural Cover Loss",
+    Type    = "ATE",
+    scale_to_ha(as.data.frame(ate_nat)[1, ], total_area_ha)
+  )
+) %>%
+  dplyr::mutate(
+    dplyr::across(dplyr::where(is.numeric), ~ round(.x, 3))
+  )
+
+print(scaled_tbl, row.names = FALSE)
