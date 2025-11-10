@@ -1,0 +1,658 @@
+# ============================================================
+# Script name: 10_gpp_cv_permutations.R
+# Project:     ABDZs_impact
+#
+# Purpose:
+#   Specification curve for treatment effects on GPP interannual variability (ΔCV)
+#   across multiple:
+#     - time windows
+#     - matching covariate sets
+#     - matching methods (logit PS, Mahalanobis, random forest)
+#
+# Design:
+#   1) Load GPP + covariates shapefile.
+#   2) Remove outer 10-km buffer.
+#   3) 2-km thinning (1 obs per 2-km supercell).
+#   4) For each time window (5yr, 6yr, 7yr):
+#        - Require FULL coverage for all years in both windows.
+#        - Compute CV_early, CV_late, and cv_change = CV_late - CV_early.
+#   5) For multiple covariate sets:
+#        - Nearest neighbor matching (logit PS + caliper 0.2 SD).
+#        - Nearest neighbor matching (Mahalanobis, 1:1, no replacement).
+#        - Optional: nearest neighbor matching using RF PS (if ranger installed).
+#   6) For each matched sample:
+#        - Run OLS: cv_change ~ TREATMENT + covariates (classical SEs).
+#   7) Build:
+#        - Specification curve (sorted ATT).
+#        - Balance-only grid.
+#        - Full spec grid (methods, balance, covariates).
+#        - Combined figure via patchwork.
+#
+# Inputs:
+#   - GPP_exports/GPP_ALL_WITH_COVARIATES.shp
+#   - OUTER_BUFFER_10km.shp
+#
+# Notes:
+#   - No install.packages() calls; all libraries assumed pre-installed.
+#   - main_effect sets the red reference in the spec curve.
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(sf)
+  library(dplyr)
+  library(MatchIt)
+  library(cobalt)
+  library(tidyr)
+  library(ggplot2)
+  library(stringr)
+  library(purrr)
+  library(patchwork)
+})
+
+set.seed(42)
+
+# ------------------------------
+# 0) Paths, CRS, main-effect for spec curve
+# ------------------------------
+in_shp            <- "GPP_exports/GPP_ALL_WITH_COVARIATES.shp"
+outer_buffer_path <- "OUTER_BUFFER_10km.shp"
+epsg_utm          <- 32718
+
+# Your main model treatment effect to highlight in the spec curve
+main_effect <- 0.0076
+
+# Strict windows (must observe every year in each window)
+time_windows <- list(
+  list(name = "5yr", early = 2001:2005, late = 2017:2021),
+  list(name = "6yr", early = 2001:2006, late = 2016:2021),
+  list(name = "7yr", early = 2001:2007, late = 2015:2021)
+)
+
+# ------------------------------
+# Helper utilities
+# ------------------------------
+rename_if_present <- function(df, from, to) {
+  if (from %in% names(df)) dplyr::rename(df, !!to := .data[[from]]) else df
+}
+
+to_int01 <- function(x){
+  if (is.factor(x)) x <- as.character(x)
+  if (is.character(x)) {
+    xl <- tolower(trimws(x))
+    x <- ifelse(
+      xl %in% c("1","true","t","yes","y","treated","treatment","abdz"), 1L,
+      ifelse(xl %in% c("0","false","f","no","n","control"), 0L, NA_integer_)
+    )
+  }
+  if (is.logical(x)) x <- as.integer(x)
+  if (is.numeric(x)) x <- ifelse(is.na(x), NA_integer_, as.integer(x != 0))
+  as.integer(x)
+}
+
+find_gpp_cols <- function(df, years) {
+  uc <- paste0("GPP_", years)
+  lc <- paste0("gpp_", years)
+  intersect(c(uc, lc), names(df))
+}
+
+cv_vec <- function(v) {
+  v <- as.numeric(v)
+  m <- mean(v, na.rm = TRUE)
+  s <- sd(v,   na.rm = TRUE)
+  if (!is.finite(m) || m == 0) NA_real_ else s / m
+}
+
+# Normalize matching method from name string
+normalize_method <- function(s) {
+  s <- tolower(s)
+  if (grepl("(^|_)logit(_|$)", s)) return("logit")
+  if (grepl("(^|_)(randomforest|rf)(_)?", s)) return("randomforest")
+  if (grepl("(^|_)maha[^_]*(_|$)", s)) return("mahalanobis")
+  toks <- unlist(strsplit(gsub("[^a-z_]", "", s), "_"))
+  toks <- toks[nzchar(toks)]
+  tgts <- c("logit","randomforest","mahalanobis")
+  if (length(toks)) {
+    d <- adist(toks, tgts)
+    j <- which.min(apply(d, 2, min))
+    if (!is.na(j) && min(d) <= 2) return(tgts[j])
+  }
+  NA_character_
+}
+
+# Extract combo_* piece (used for covariate flags)
+extract_combo <- function(s) {
+  m <- stringr::str_match(
+    s,
+    "^(combo_.*?)[_]?(logit|randomforest|maha\w*)?_(5yr|6yr|7yr)(?:_(mean|iav))?$"
+  )
+  out <- m[,2]
+  out[is.na(out)] <- NA_character_
+  out
+}
+
+# Manual Mahalanobis NN (1:1, no replacement; ATT-style)
+mahalanobis_match <- function(data, treat_var, covars) {
+  stopifnot(treat_var %in% names(data))
+  dat <- data[, c(treat_var, covars), drop = FALSE]
+  X <- model.matrix(as.formula(paste("~ 0 +", paste(covars, collapse = " + "))), data = dat)
+  nzv <- apply(X, 2, function(v) {
+    s <- sd(v)
+    is.finite(s) && s > 0
+  })
+  if (!any(nzv)) stop("Mahalanobis: no usable covariates (all zero-variance).")
+  X <- X[, nzv, drop = FALSE]
+  keep <- stats::complete.cases(X) & !is.na(dat[[treat_var]])
+  dat  <- dat[keep, , drop = FALSE]
+  X    <- X[keep, , drop = FALSE]
+  tr   <- dat[[treat_var]] == 1
+  co   <- dat[[treat_var]] == 0
+  if (sum(tr) < 1 || sum(co) < 1) stop("Mahalanobis: need both treated and control.")
+  Xt <- X[tr, , drop = FALSE]
+  Xc <- X[co, , drop = FALSE]
+  S  <- stats::cov(X)
+  if (any(!is.finite(S))) stop("Mahalanobis: non-finite covariance.")
+  Sinv <- tryCatch(solve(S), error = function(e) NULL)
+  if (is.null(Sinv)) {
+    eig <- eigen(S)
+    eig$values[eig$values < 1e-8] <- 1e-8
+    Sreg <- eig$vectors %*% diag(eig$values) %*% t(eig$vectors)
+    Sinv <- solve(Sreg)
+  }
+  t_idx   <- which(tr)
+  c_idx   <- which(co)
+  used_c  <- rep(FALSE, length(c_idx))
+  pairs   <- vector("list", length(t_idx))
+  for (i in seq_along(t_idx)) {
+    xi <- Xt[i, , drop = FALSE]
+    avail <- which(!used_c)
+    if (!length(avail)) break
+    Xc_av <- Xc[avail, , drop = FALSE]
+    d <- mahalanobis(x = Xc_av, center = as.numeric(xi), cov = S, inverted = FALSE)
+    j <- avail[which.min(d)]
+    pairs[[i]] <- c(t_idx[i], c_idx[j])
+    used_c[which(avail == j)] <- TRUE
+  }
+  pairs <- do.call(rbind, pairs)
+  pairs <- pairs[stats::complete.cases(pairs), , drop = FALSE]
+  if (!nrow(pairs)) stop("Mahalanobis: matching produced zero pairs.")
+  keep_rows <- unique(as.vector(pairs))
+  matched <- data[keep, , drop = FALSE][keep_rows, , drop = FALSE]
+  matched$weights <- 1
+  matched
+}
+
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+# ------------------------------
+# 1) Load, project, rename
+# ------------------------------
+x <- sf::st_read(in_shp, quiet = TRUE)
+if (isTRUE(sf::st_is_longlat(x))) x <- sf::st_transform(x, epsg_utm)
+
+x <- x %>%
+  rename_if_present("ACCESSIBIL", "accessibility") %>%
+  rename_if_present("ELEVATIONM", "elevation") %>%
+  rename_if_present("SLOPEMEAN",  "slope") %>%
+  rename_if_present("PRECIPITAT", "precipitation") %>%
+  rename_if_present("TEMP_MEAN",  "temperature") %>%
+  rename_if_present("POPDENS_ME","population_density") %>%
+  rename_if_present("ing_pc_",    "INCOME") %>%
+  rename_if_present("Hub_distan", "distance_to_road") %>%
+  rename_if_present("AGRICULTUR", "CROP_2000")
+
+stopifnot("TREATMENT" %in% names(x))
+x$TREATMENT <- to_int01(x$TREATMENT)
+
+# Force all GPP_* to numeric
+x <- x %>%
+  mutate(across(matches("^GPP_\d{4}$"), ~ suppressWarnings(as.numeric(.))))
+
+# ------------------------------
+# 2) Remove cells intersecting OUTER_BUFFER_10km
+# ------------------------------
+stopifnot(file.exists(outer_buffer_path))
+outer10 <- sf::st_read(outer_buffer_path, quiet = TRUE) |>
+  sf::st_transform(epsg_utm) |>
+  sf::st_make_valid()
+outer10_u <- sf::st_union(outer10)
+
+n0 <- nrow(x)
+x  <- x[lengths(sf::st_intersects(x, outer10_u)) == 0L, ]
+message("Removed ", n0 - nrow(x), " cells intersecting OUTER_BUFFER_10km; kept ", nrow(x), ".")
+
+# ------------------------------
+# 3) 2-km thinning (one obs per 2-km cell)
+# ------------------------------
+cent <- sf::st_centroid(x)
+xy   <- sf::st_coordinates(cent)
+
+x <- x %>%
+  mutate(
+    x_coord = xy[,1],
+    y_coord = xy[,2],
+    super_x = floor(x_coord / 2000),
+    super_y = floor(y_coord / 2000)
+  ) %>%
+  group_by(super_x, super_y) %>%
+  slice(1) %>%
+  ungroup()
+
+# ------------------------------
+# 4) Prep data frame
+# ------------------------------
+df_all <- sf::st_drop_geometry(x)
+df_all <- as.data.frame(df_all, stringsAsFactors = FALSE)
+rownames(df_all) <- seq_len(nrow(df_all))
+
+# ------------------------------
+# 5) Covariates:
+#    Always: precipitation, elevation, population_density
+#    Optional: temperature, slope, accessibility, INCOME, distance_to_road
+# ------------------------------
+always_covs   <- c("precipitation","elevation","population_density")
+optional_covs <- c("temperature","slope","accessibility","INCOME","distance_to_road")
+
+always_covs   <- intersect(always_covs,   names(df_all))
+optional_covs <- intersect(optional_covs, names(df_all))
+
+optional_combos <- c(
+  list(character(0)),
+  unlist(
+    lapply(seq_along(optional_covs), function(n)
+      combn(optional_covs, n, simplify = FALSE)),
+    recursive = FALSE
+  )
+)
+
+combo_key   <- function(x) paste(sort(x), collapse = "|")
+all_combos0 <- unique(optional_combos)
+names(all_combos0) <- vapply(all_combos0, combo_key, "")
+
+# Matching methods
+methods <- c("logit", "mahalanobis", "randomforest")
+if (!requireNamespace("ranger", quietly = TRUE)) {
+  methods <- c("logit", "mahalanobis")
+  message("NOTE: 'ranger' not available; skipping randomforest propensity.")
+}
+
+# ------------------------------
+# 6) Loop over windows: strict coverage, matching, OLS
+# ------------------------------
+all_results <- list()
+
+for (tw in time_windows) {
+  tw_name    <- tw$name
+  early_cols <- find_gpp_cols(df_all, tw$early)
+  late_cols  <- find_gpp_cols(df_all, tw$late)
+
+  if (length(early_cols) == 0 || length(late_cols) == 0) {
+    message("[Window ", tw_name, "] No GPP columns found; skipping.")
+    next
+  }
+
+  M_early <- as.matrix(df_all[, early_cols, drop = FALSE])
+  M_late  <- as.matrix(df_all[, late_cols,  drop = FALSE])
+
+  keep <- rowSums(is.na(M_early)) == 0 &
+          rowSums(is.na(M_late))  == 0 &
+          df_all$TREATMENT %in% c(0L, 1L)
+
+  df_tw   <- df_all[keep, , drop = FALSE]
+  M_early <- M_early[keep, , drop = FALSE]
+  M_late  <- M_late[keep,  , drop = FALSE]
+
+  cv_early  <- apply(M_early, 1, cv_vec)
+  cv_late   <- apply(M_late,  1, cv_vec)
+  cv_change <- cv_late - cv_early
+
+  ok <- is.finite(cv_change)
+  df_tw <- df_tw[ok, , drop = FALSE]
+  df_tw$cv_change <- cv_change[ok]
+
+  message(sprintf("[Window %s] Kept %s rows after strict coverage.", tw_name, nrow(df_tw)))
+  if (nrow(df_tw) < 10) {
+    message("[Window ", tw_name, "] Too few rows; skipping.")
+    next
+  }
+
+  match_results  <- list()
+  lm_results     <- tibble()
+  balance_labels <- tibble()
+
+  combos_this <- lapply(all_combos0, function(opt) unique(c(always_covs, opt)))
+  combos_this <- lapply(combos_this, function(v) intersect(v, names(df_tw)))
+  combos_this <- combos_this[lengths(combos_this) > 0]
+
+  for (combo in combos_this) {
+    combo_name  <- paste0("combo_", paste(combo, collapse = "--"))
+    cov_formula <- as.formula(paste("TREATMENT ~", paste(combo, collapse = " + ")))
+
+    for (method in methods) {
+      result_name <- paste0(combo_name, "_", method, "_", tw_name)
+      mobj <- NULL
+      matched <- NULL
+      weights_vec <- NULL
+      is_manual_mahal <- FALSE
+
+      # --- Matching ---
+      if (identical(method, "mahalanobis")) {
+        matched <- tryCatch(
+          mahalanobis_match(
+            data      = df_tw[, c("TREATMENT","cv_change", combo), drop = FALSE],
+            treat_var = "TREATMENT",
+            covars    = combo
+          ),
+          error = function(e) { message("  [", result_name, "] Mahalanobis error: ", conditionMessage(e)); NULL }
+        )
+        if (is.null(matched)) next
+        weights_vec <- matched$weights
+        is_manual_mahal <- TRUE
+        match_results[[result_name]] <- list(
+          .type  = "manual_mahal",
+          data   = matched,
+          covars = combo
+        )
+      } else {
+        mobj <- tryCatch(
+          MatchIt::matchit(
+            cov_formula,
+            data        = df_tw,
+            method      = "nearest",
+            distance    = method,
+            caliper     = 0.2,
+            std.caliper = TRUE
+          ),
+          error = function(e) { message("  [", result_name, "] matchit error: ", conditionMessage(e)); NULL }
+        )
+        if (is.null(mobj)) next
+        match_results[[result_name]] <- mobj
+        matched <- tryCatch(MatchIt::match.data(mobj), error = function(e) NULL)
+        if (is.null(matched)) next
+        weights_vec <- matched$weights %||% 1
+      }
+
+      nt    <- sum(matched$TREATMENT == 1, na.rm = TRUE)
+      nc    <- sum(matched$TREATMENT == 0, na.rm = TRUE)
+      sd_cv <- sd(matched$cv_change, na.rm = TRUE)
+      message(sprintf("  [%s] matched N=%d (T=%d, C=%d); sd(ΔCV)=%.4g",
+                      result_name, nrow(matched), nt, nc, sd_cv))
+      if (length(unique(matched$TREATMENT)) < 2 || sd_cv == 0) next
+
+      # --- Balance ---
+      bal <- tryCatch({
+        if (is_manual_mahal) {
+          cobalt::bal.tab(
+            as.formula(paste("TREATMENT ~", paste(combo, collapse = " + "))),
+            data    = matched,
+            weights = weights_vec,
+            estimand = "ATT",
+            un = FALSE
+          )
+        } else {
+          cobalt::bal.tab(mobj, un = FALSE)
+        }
+      }, error = function(e) NULL)
+
+      if (!is.null(bal) && !is.null(bal$Balance)) {
+        btab <- bal$Balance
+        smd_col <- intersect(
+          colnames(btab),
+          c("Std.Diff.Adj","Std.Diff.Adj.","M.Diff.Adj","Diff.Adj")
+        )
+        max_smd <- if (length(smd_col)) suppressWarnings(max(abs(btab[[smd_col[1]]]), na.rm = TRUE)) else NA_real_
+        max_smd <- ifelse(is.finite(max_smd), max_smd, NA_real_)
+        b_label <- dplyr::case_when(
+          !is.na(max_smd) & max_smd < 0.05 ~ "balance_moderate",
+          !is.na(max_smd) & max_smd < 0.10 ~ "balance_good",
+          !is.na(max_smd)                  ~ "balance_poor",
+          TRUE                             ~ "unknown"
+        )
+        balance_labels <- bind_rows(
+          balance_labels,
+          tibble(
+            Matching_Set = result_name,
+            Balance_Label = b_label,
+            Max_Post_SMD = max_smd
+          )
+        )
+      }
+
+      # --- OLS with classical SE ---
+      tr <- tryCatch({
+        form <- as.formula(
+          paste("cv_change ~ TREATMENT +", paste(combo, collapse = " + "))
+        )
+        fit <- lm(form, data = matched, weights = weights_vec)
+        cs  <- summary(fit)$coefficients
+        if ("TREATMENT" %in% rownames(cs)) cs["TREATMENT", , drop = FALSE] else NULL
+      }, error = function(e) {
+        message("  [", result_name, "] OLS error: ", conditionMessage(e))
+        NULL
+      })
+
+      if (!is.null(tr)) {
+        lm_results <- bind_rows(
+          lm_results,
+          tibble(
+            Matching_Set = result_name,
+            Estimate     = as.numeric(tr[,"Estimate"]),
+            Std_Error    = as.numeric(tr[,"Std. Error"]),
+            P_value_LM   = as.numeric(tr[,"Pr(>|t|)"])
+          )
+        )
+      }
+    }
+  }
+
+  n_succeeded <- nrow(lm_results)
+  n_signif    <- sum(!is.na(lm_results$P_value_LM) & lm_results$P_value_LM < 0.05)
+  message(sprintf("[Window %s] Successful OLS models: %s; Significant (p<0.05): %s",
+                  tw_name, n_succeeded, n_signif))
+
+  all_results[[tw_name]] <- list(
+    match_results  = match_results,
+    lm_results     = lm_results,
+    balance_labels = balance_labels
+  )
+}
+
+# ------------------------------
+# 7) Combine results across windows
+# ------------------------------
+combined_lm <- bind_rows(lapply(names(all_results), function(nm) {
+  ar <- all_results[[nm]]$lm_results
+  if (!is.null(ar) && nrow(ar) > 0)
+    mutate(ar, Time_Window = nm)
+})) %>% as_tibble()
+
+combined_bal <- bind_rows(lapply(names(all_results), function(nm) {
+  ab <- all_results[[nm]]$balance_labels
+  if (!is.null(ab) && nrow(ab) > 0)
+    mutate(ab, Time_Window = nm)
+})) %>% as_tibble()
+
+if (is.null(combined_lm) || nrow(combined_lm) == 0) {
+  stop("No OLS results were produced. Check coverage/matching logs above.")
+}
+
+overall_n_models <- nrow(combined_lm)
+overall_n_sig    <- sum(combined_lm$P_value_LM < 0.05, na.rm = TRUE)
+message(sprintf("TOTAL successful OLS models: %s; Significant (p<0.05): %s (%.1f%%)",
+                overall_n_models, overall_n_sig, 100*overall_n_sig/overall_n_models))
+
+# ------------------------------
+# 8) Clean merge (Matching_Set + Time_Window)
+# ------------------------------
+models <- combined_lm %>%
+  mutate(
+    Matching_Set = as.character(Matching_Set),
+    Time_Window  = as.character(Time_Window)
+  ) %>%
+  left_join(
+    combined_bal %>%
+      mutate(
+        Matching_Set = as.character(Matching_Set),
+        Time_Window  = as.character(Time_Window)
+      ) %>%
+      select(Matching_Set, Time_Window, Balance_Label, Max_Post_SMD),
+    by = c("Matching_Set","Time_Window")
+  ) %>%
+  mutate(
+    Balance_Label = tidyr::replace_na(Balance_Label, "unknown")
+  ) %>%
+  distinct(Matching_Set, Time_Window, .keep_all = TRUE)
+
+# ------------------------------
+# 9) Specification curve
+# ------------------------------
+spec_curve <- models %>%
+  arrange(Estimate) %>%
+  mutate(
+    Model_ID = row_number(),
+    SigFlag  = ifelse(P_value_LM < 0.05, "Significant", "Not Significant")
+  )
+
+idx_main <- which.min(abs(spec_curve$Estimate - main_effect))
+
+p_spec <- ggplot(spec_curve, aes(x = factor(Model_ID), y = Estimate, fill = SigFlag)) +
+  geom_col(width = 0.9) +
+  geom_hline(yintercept = 0, linetype = 2, color = "black", linewidth = 0.3) +
+  { if (length(idx_main) == 1 && is.finite(idx_main)) geom_vline(xintercept = idx_main, linetype = "dashed", color = "red", linewidth = 0.7) } +
+  { if (length(idx_main) == 1 && is.finite(idx_main))
+      annotate("text",
+               x = idx_main,
+               y = max(spec_curve$Estimate, na.rm = TRUE),
+               label = paste0(" main model ~ ", format(main_effect, digits = 3)),
+               hjust = -0.1, vjust = 1.2,
+               color = "red", size = 3.0)
+  } +
+  scale_fill_manual(values = c("Significant" = "steelblue", "Not Significant" = "grey80")) +
+  labs(
+    title = "OLS treatment effects on ΔCV across matching specifications",
+    x = "Model ID (sorted by estimate)",
+    y = "OLS Estimate (ΔCV effect)",
+    fill = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x  = element_blank(),
+    axis.ticks.x = element_blank()
+  )
+
+# ------------------------------
+# 10) Balance-only grid
+# ------------------------------
+bal_levels <- c("balance_good", "balance_moderate", "balance_poor", "unknown")
+
+models_w <- models %>%
+  mutate(Balance_Label = factor(Balance_Label, levels = bal_levels)) %>%
+  group_by(Time_Window) %>%
+  arrange(P_value_LM, .by_group = TRUE) %>%
+  mutate(Model_ID = row_number()) %>%
+  ungroup()
+
+p_balance <- ggplot(
+  models_w,
+  aes(x = factor(Model_ID), y = Balance_Label, color = P_value_LM < 0.05)
+) +
+  geom_point(size = 2.6) +
+  scale_color_manual(
+    values = c(`TRUE` = "steelblue", `FALSE` = "grey70"),
+    name = "OLS p < 0.05"
+  ) +
+  facet_wrap(~ Time_Window, scales = "free_x") +
+  labs(
+    title = "Balance quality per specification",
+    x = "Model (ordered by OLS p-value within window)",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x  = element_blank(),
+    axis.ticks.x = element_blank()
+  )
+
+# ------------------------------
+# 11) Full spec grid (methods + covariates + significance)
+# ------------------------------
+models_w <- models_w %>%
+  mutate(
+    method     = vapply(Matching_Set, normalize_method, character(1)),
+    combo_part = extract_combo(Matching_Set),
+    covariates = strsplit(gsub("^combo_", "", ifelse(is.na(combo_part), "", combo_part)), "--"),
+    Sig_LM     = ifelse(P_value_LM < 0.05, "Significance_LM", NA_character_)
+  )
+
+grid_df <- models_w %>%
+  rowwise() %>%
+  mutate(
+    Features = list(
+      c(
+        Sig_LM,
+        as.character(Balance_Label),
+        method,
+        unlist(covariates)
+      )
+    )
+  ) %>%
+  ungroup() %>%
+  tidyr::unnest_longer(Features) %>%
+  filter(!is.na(Features))
+
+feature_order <- c(
+  "Significance_LM",
+  "balance_good","balance_moderate","balance_poor","unknown",
+  "randomforest","mahalanobis","logit",
+  "INCOME","accessibility","slope","temperature","distance_to_road",
+  "precipitation","elevation","population_density","CROP_2000"
+)
+
+grid_df <- grid_df %>%
+  filter(Features %in% feature_order) %>%
+  mutate(
+    Feature   = factor(Features, levels = feature_order),
+    Model_ID2 = Model_ID  # preserve ID for plotting
+  )
+
+p_grid <- ggplot(grid_df, aes(x = factor(Model_ID2), y = Feature)) +
+  geom_point(color = "steelblue", size = 2.2) +
+  facet_wrap(~ Time_Window, scales = "free_x") +
+  labs(
+    title = "Specification grid — GPP interannual variability (ΔCV)",
+    x = "Model (within window)",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x  = element_blank(),
+    axis.ticks.x = element_blank(),
+    panel.grid   = element_blank()
+  )
+
+# ------------------------------
+# 12) Combined figure (A/B/C panels)
+# ------------------------------
+combined_plot <- p_spec / p_balance / p_grid + plot_annotation(tag_levels = "A")
+print(combined_plot)
+
+# ------------------------------
+# 13) Quick summaries
+# ------------------------------
+cat("\n=== Quick counts ===\n")
+cat("Total successful OLS models:", nrow(models), "\n")
+cat("Significant (p<0.05):", sum(models$P_value_LM < 0.05, na.rm = TRUE), "\n\n")
+
+models %>%
+  count(Time_Window, Balance_Label) %>%
+  group_by(Time_Window) %>%
+  mutate(share = round(100 * n / sum(n), 1)) %>%
+  arrange(Time_Window, Balance_Label) %>%
+  print(n = Inf)
+
+sig_share <- with(models, {
+  n_sig <- sum(P_value_LM < 0.05, na.rm = TRUE)
+  paste0(n_sig, " of ", nrow(models), " models (", round(100 * n_sig / max(1, nrow(models)), 1), "%) are significant.")
+})
+cat("\n", sig_share, "\n", sep = "")
+
+cat("\n✅ GPP IAV specification-curve pipeline completed.\n")
