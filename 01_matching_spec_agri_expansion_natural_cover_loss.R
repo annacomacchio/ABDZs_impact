@@ -9,7 +9,7 @@
 #   samples. Additionally, compute and visualize the semivariogram of
 #   agricultural expansion for matched units.
 #
-# Inputs (expected in working directory):
+# Inputs (expected in working directory): 
 #   - COVARIATES_ALL_NO_COTAHUASI.shp
 #   - OUTER_BUFFER_10km.shp
 #
