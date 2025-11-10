@@ -1,0 +1,216 @@
+# ============================================================
+# Script: Averaging_land_cover_and_reclassification.R
+# Purpose:
+#   1) Clip MapBiomas classification rasters to AOI.
+#   2) Compute per-pixel modal class for:
+#        - 2000–2002 ("2000s" window)
+#        - 2020–2022 ("2020s" window)
+#   3) Reclassify both modal rasters into 5 land-cover groups:
+#        1 = AGRICULTURE
+#        2 = OTHER_NON_VEG
+#        3 = FOREST
+#        4 = GRASSLAND
+#        5 = MINING
+#   4) Export GeoTIFFs ready for QGIS zonal stats.
+#
+# Inputs:
+#   - peru_collection3_integration_v1-classification_2000.tif
+#   - peru_collection3_integration_v1-classification_2001.tif
+#   - peru_collection3_integration_v1-classification_2002.tif
+#   - peru_collection3_integration_v1-classification_2020.tif
+#   - peru_collection3_integration_v1-classification_2021.tif
+#   - peru_collection3_integration_v1-classification_2022.tif
+#   - COVARIATES_ALL_NO_COTAHUASI.shp (AOI for clipping)
+#
+# Outputs:
+#   - mode_landcover_2000_2002_AOI.tif
+#   - mode_landcover_2020_2022_AOI.tif
+#   - grouped_lulc_2000.tif
+#   - grouped_lulc_2020.tif
+#
+# Notes:
+#   - Uses terra only (no install.packages() here).
+#   - Assumes all MapBiomas rasters share the same grid.
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(terra)
+})
+
+# --------------------------
+# 1) Load rasters
+# --------------------------
+r2000 <- rast("peru_collection3_integration_v1-classification_2000.tif")
+r2001 <- rast("peru_collection3_integration_v1-classification_2001.tif")
+r2002 <- rast("peru_collection3_integration_v1-classification_2002.tif")
+
+r2020 <- rast("peru_collection3_integration_v1-classification_2020.tif")
+r2021 <- rast("peru_collection3_integration_v1-classification_2021.tif")
+r2022 <- rast("peru_collection3_integration_v1-classification_2022.tif")
+
+# Check CRS consistency (stop if mismatch)
+stopifnot(
+  all.equal(crs(r2000), crs(r2001)) == TRUE,
+  all.equal(crs(r2000), crs(r2002)) == TRUE,
+  all.equal(crs(r2000), crs(r2020)) == TRUE,
+  all.equal(crs(r2000), crs(r2021)) == TRUE,
+  all.equal(crs(r2000), crs(r2022)) == TRUE
+)
+
+# --------------------------
+# 2) Load AOI and match CRS
+# --------------------------
+aoi_path <- "COVARIATES_ALL_NO_COTAHUASI.shp"
+stopifnot(file.exists(aoi_path))
+
+aoi <- vect(aoi_path)
+
+# Fix invalid geometry if needed
+aoi <- tryCatch(makeValid(aoi), error = function(e) aoi)
+
+# Reproject AOI to raster CRS if needed
+if (!identical(crs(aoi, proj=TRUE), crs(r2000, proj=TRUE))) {
+  aoi <- project(aoi, r2000)
+}
+
+# --------------------------
+# 3) Clip (crop + mask) each raster to AOI
+# --------------------------
+clip_to_aoi <- function(r, poly) {
+  r_c <- crop(r, poly)
+  mask(r_c, poly)
+}
+
+r2000_c <- clip_to_aoi(r2000, aoi)
+r2001_c <- clip_to_aoi(r2001, aoi)
+r2002_c <- clip_to_aoi(r2002, aoi)
+
+r2020_c <- clip_to_aoi(r2020, aoi)
+r2021_c <- clip_to_aoi(r2021, aoi)
+r2022_c <- clip_to_aoi(r2022, aoi)
+
+# --------------------------
+# 4) Build stacks and compute per-pixel mode
+# --------------------------
+stack_2000s <- c(r2000_c, r2001_c, r2002_c)
+stack_2020s <- c(r2020_c, r2021_c, r2022_c)
+
+mode_fun <- function(x) {
+  x <- x[!is.na(x)]
+  if (length(x) == 0) return(NA)
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+}
+
+mode_2000s <- app(stack_2000s, mode_fun)
+mode_2020s <- app(stack_2020s, mode_fun)
+
+names(mode_2000s) <- "mode_2000_2002"
+names(mode_2020s) <- "mode_2020_2022"
+
+# --------------------------
+# 5) Save modal rasters
+# --------------------------
+wopt_mode <- list(
+  datatype = "INT2U",
+  gdal     = c("COMPRESS=LZW", "PREDICTOR=2")
+)
+
+writeRaster(
+  mode_2000s,
+  "mode_landcover_2000_2002_AOI.tif",
+  overwrite = TRUE,
+  wopt = wopt_mode
+)
+
+writeRaster(
+  mode_2020s,
+  "mode_landcover_2020_2022_AOI.tif",
+  overwrite = TRUE,
+  wopt = wopt_mode
+)
+
+# ============================================================
+# 6) Reclassify to 5 groups and save grouped GeoTIFFs
+# ============================================================
+
+mode_2000s <- rast("mode_landcover_2000_2002_AOI.tif")
+mode_2020s <- rast("mode_landcover_2020_2022_AOI.tif")
+stopifnot(compareGeom(mode_2000s, mode_2020s, stopOnError = FALSE))
+
+# Aggregation:
+#  1 = AGRICULTURE     : 21, 15, 72, 9
+#  2 = OTHER_NON_VEG   : 24, 25, 33, 34, 23, 29, 61, 68
+#  3 = FOREST          : 3, 4
+#  4 = GRASSLAND       : 12, 11, 13, 66
+#  5 = MINING          : 30
+# Unmapped codes (e.g., 27 "No observado") -> NA (and stored as 0 via NAflag)
+
+labels_tbl <- data.frame(
+  ID    = c(1,2,3,4,5),
+  class = c("AGRICULTURE","OTHER_NON_VEG","FOREST","GRASSLAND","MINING"),
+  stringsAsFactors = FALSE
+)
+
+agg_map <- data.frame(
+  from = c(
+    # AGRICULTURE
+    21, 15, 72, 9,
+    # OTHER_NON_VEG
+    24, 25, 33, 34, 23, 29, 61, 68,
+    # FOREST
+    3, 4,
+    # GRASSLAND / natural non-forest vegetation
+    12, 11, 13, 66,
+    # MINING
+    30
+  ),
+  becomes = c(
+    rep(1, 4),   # AGRICULTURE
+    rep(2, 8),   # OTHER_NON_VEG
+    rep(3, 2),   # FOREST
+    rep(4, 4),   # GRASSLAND
+    5            # MINING
+  )
+)
+
+# Warn on unmapped codes (will be NA/0)
+present_codes <- function(r) {
+  f <- as.data.frame(terra::freq(r))
+  sort(unique(f$value[!is.na(f$value)]))
+}
+present_all <- sort(unique(c(present_codes(mode_2000s), present_codes(mode_2020s))))
+unmapped <- setdiff(present_all, agg_map$from)
+if (length(unmapped)) {
+  message("Unmapped codes present (left as NA / 0): ", paste(unmapped, collapse = ", "))
+}
+
+# Exact-match reclassification (others -> NA)
+r2000_grp <- subst(mode_2000s, from = agg_map$from, to = agg_map$becomes, others = NA)
+r2020_grp <- subst(mode_2020s, from = agg_map$from, to = agg_map$becomes, others = NA)
+
+# Make categorical & attach labels
+r2000_grp <- as.factor(r2000_grp); levels(r2000_grp) <- labels_tbl; names(r2000_grp) <- "group"
+r2020_grp <- as.factor(r2020_grp); levels(r2020_grp) <- labels_tbl; names(r2020_grp) <- "group"
+
+# Save compact tiled GeoTIFFs for QGIS (0 = NoData)
+wopt_grp <- list(
+  datatype = "INT1U",  # 0..255
+  NAflag   = 0,
+  gdal     = c(
+    "COMPRESS=DEFLATE",
+    "PREDICTOR=2",
+    "ZLEVEL=6",
+    "TILED=YES",
+    "BIGTIFF=IF_SAFER"
+  )
+)
+
+writeRaster(r2000_grp, "grouped_lulc_2000.tif", overwrite = TRUE, wopt = wopt_grp)
+writeRaster(r2020_grp, "grouped_lulc_2020.tif", overwrite = TRUE, wopt = wopt_grp)
+
+message("✅ Done. Outputs written:")
+message(" - mode_landcover_2000_2002_AOI.tif")
+message(" - mode_landcover_2020_2022_AOI.tif")
+message(" - grouped_lulc_2000.tif")
+message(" - grouped_lulc_2020.tif")
