@@ -1,0 +1,664 @@
+# ============================================================
+# Script name: 10_Mean_field_size_permutations.R
+# Project:     ABDZs_impact
+#
+# Integrated pipeline: 4-km thinning + matching + OLS spec grid
+#
+# Steps:
+#   1) Load patch metrics + covariates.
+#   2) Remove outer 10-km buffer (if provided).
+#   3) Keep ~full pixels and thin to a 4-km lattice (1 obs per cell).
+#   4) Define outcome: delta_patch = mean_patch_size_ha_2022 - mean_patch_size_ha_2000.
+#   5) Build multiple covariate sets (with income as OPTIONAL).
+#   6) For each set, run:
+#        - Nearest Neighbor (logit PS, caliper 0.2 SD, no replacement)
+#        - Nearest Neighbor (Mahalanobis, no caliper)
+#        - Optionally Nearest Neighbor (Random Forest PS), if ranger is installed
+#   7) Fit OLS with robust (HC1) SE using matching weights.
+#   8) Output:
+#        - Spec grid plot (which covariates/methods used)
+#        - s-chart style plots & text summaries of estimates.
+#
+# Inputs:
+#   - results_80_NEW/patch_metrics_all_clean_with_treatment.gpkg
+#   - OUTER_BUFFER_10km.shp  (optional but recommended)
+#
+# Notes:
+#   - Uses only library() calls (no install.packages()).
+#   - You can tweak main_att, covariate sets, or spacing_m as needed.
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(sf)
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(MatchIt)
+  library(cobalt)
+  library(readr)
+  library(sandwich)
+  library(lmtest)
+  library(broom)
+})
+
+set.seed(42)
+
+# ------------------------------------------------------------
+# 0) Paths & core parameters
+# ------------------------------------------------------------
+in_path           <- "results_80_NEW/patch_metrics_all_clean_with_treatment.gpkg"
+in_layer          <- "patch_metrics_all_clean_with_treatment"
+outer_buffer_path <- "OUTER_BUFFER_10km.shp"  # shp/gpkg/geojson allowed
+
+spacing_m          <- 4000    # 4-km lattice spacing (updated)
+min_pixel_fullness <- 0.99    # keep >= 99% full pixels
+
+# ------------------------------------------------------------
+# 1) Read & reproject sf to meters if needed
+# ------------------------------------------------------------
+g <- sf::st_read(in_path, layer = in_layer, quiet = TRUE)
+
+if (isTRUE(sf::st_is_longlat(g))) {
+  # Use appropriate projected CRS for your region (example: 32718)
+  g <- sf::st_transform(g, 32718)
+}
+
+# ------------------------------------------------------------
+# 2) Standardize covariate names (if present)
+# ------------------------------------------------------------
+rename_if_present <- function(df, from, to) {
+  if (from %in% names(df)) dplyr::rename(df, !!to := .data[[from]]) else df
+}
+
+rename_map <- c(
+  "PRECIPITAT" = "precipitation",
+  "TEMP_MEAN"  = "temperature",
+  "POPDENS_ME" = "population_density",
+  "ELEVATIONM" = "elevation",
+  "SLOPEMEAN"  = "slope",
+  "Hub.distan" = "distance_to_road",
+  "ACCESSIBIL" = "accessibility",
+  "AGRICULTUR" = "crop_2000s",
+  "ing_pc_"    = "income"
+)
+for (k in names(rename_map)) {
+  g <- rename_if_present(g, k, rename_map[[k]])
+}
+
+# Alias expected by some formulas
+if (!"CROP_2000" %in% names(g) && "crop_2000s" %in% names(g)) {
+  g$CROP_2000 <- g$crop_2000s
+}
+
+# ------------------------------------------------------------
+# 3) Coerce TREATMENT to 0/1
+# ------------------------------------------------------------
+to_int01 <- function(x){
+  if (is.factor(x)) x <- as.character(x)
+  if (is.character(x)) {
+    xl <- tolower(trimws(x))
+    x <- ifelse(
+      xl %in% c("1","true","t","yes","y","treated","treatment","abdz"), 1L,
+      ifelse(xl %in% c("0","false","f","no","n","control"), 0L, NA_integer_)
+    )
+  }
+  if (is.logical(x)) x <- as.integer(x)
+  if (is.numeric(x)) x <- ifelse(is.na(x), NA_integer_, as.integer(x != 0))
+  as.integer(x)
+}
+
+stopifnot("TREATMENT" %in% names(g))
+g$TREATMENT <- to_int01(g$TREATMENT)
+
+cat("Loaded rows:", nrow(g), " | columns:", ncol(g), "
+")
+
+# ------------------------------------------------------------
+# 4) Remove cells intersecting OUTER_BUFFER_10km (if available)
+# ------------------------------------------------------------
+if (file.exists(outer_buffer_path)) {
+  outer10 <- sf::st_read(outer_buffer_path, quiet = TRUE) |>
+    sf::st_transform(sf::st_crs(g)) |>
+    sf::st_make_valid()
+  outer10_u <- sf::st_union(outer10)
+
+  n0 <- nrow(g)
+  hits <- lengths(sf::st_intersects(g, outer10_u)) > 0L
+  g <- g[!hits, ]
+  message("Removed ", n0 - nrow(g),
+          " cells intersecting OUTER_BUFFER_10km; kept ", nrow(g), ".")
+} else {
+  warning("outer_buffer_path not found: ", outer_buffer_path,
+          " — skipping buffer removal.")
+}
+
+# ------------------------------------------------------------
+# 5) Keep near-full pixels & thin to 4-km lattice (1 per cell)
+# ------------------------------------------------------------
+# Estimate "full" pixel area from data
+pixel_area_full <- stats::median(as.numeric(sf::st_area(g)), na.rm = TRUE)
+
+geom_col <- attr(g, "sf_column")
+if (is.null(geom_col)) geom_col <- "geometry"
+
+g <- g |>
+  dplyr::mutate(
+    pixel_area_m2  = as.numeric(sf::st_area(.data[[geom_col]])),
+    pixel_fullness = pmin(pixel_area_m2 / pixel_area_full, 1)
+  ) |>
+  dplyr::filter(pixel_fullness >= min_pixel_fullness)
+
+cent <- sf::st_centroid(g)
+xy   <- sf::st_coordinates(cent)
+
+g <- g %>%
+  dplyr::mutate(
+    x_coord = xy[,1],
+    y_coord = xy[,2]
+  )
+
+x0   <- min(g$x_coord, na.rm = TRUE)
+y0   <- min(g$y_coord, na.rm = TRUE)
+x_off <- x0 %% spacing_m
+y_off <- y0 %% spacing_m
+
+g <- g %>%
+  dplyr::mutate(
+    cell_x = floor((x_coord - x_off) / spacing_m),
+    cell_y = floor((y_coord - y_off) / spacing_m)
+  )
+
+sample_4km_nearest_center <- function(df) {
+  df %>%
+    dplyr::group_by(cell_x, cell_y) %>%
+    dplyr::mutate(
+      cx = cell_x * spacing_m + spacing_m/2 + x_off,
+      cy = cell_y * spacing_m + spacing_m/2 + y_off,
+      d2 = (x_coord - cx)^2 + (y_coord - cy)^2
+    ) %>%
+    dplyr::arrange(d2, .by_group = TRUE) %>%
+    dplyr::slice(1) %>%
+    dplyr::ungroup() %>%
+    dplyr::select(-cx, -cy, -d2)
+}
+
+sf_sampled <- sample_4km_nearest_center(g)
+
+message("After 4-km thinning (full pixels only): n = ", nrow(sf_sampled))
+stopifnot(
+  nrow(
+    sf_sampled %>%
+      dplyr::count(cell_x, cell_y) %>%
+      dplyr::filter(n > 1)
+  ) == 0L
+)
+
+# ------------------------------------------------------------
+# 6) Drop geometry & define outcome
+# ------------------------------------------------------------
+df0 <- sf::st_drop_geometry(sf_sampled)
+
+stopifnot(all(c("mean_patch_size_ha_2000","mean_patch_size_ha_2022") %in% names(df0)))
+
+df0 <- df0 %>%
+  dplyr::mutate(delta_patch = mean_patch_size_ha_2022 - mean_patch_size_ha_2000)
+
+# Pre-match clean
+df <- df0 %>%
+  dplyr::filter(
+    !is.na(mean_patch_size_ha_2000),
+    mean_patch_size_ha_2000 > 0,
+    !is.na(delta_patch),
+    !is.na(TREATMENT)
+  )
+
+message("After pre-match clean: n = ", nrow(df))
+
+# ------------------------------------------------------------
+# 7) Covariate sets (income OPTIONAL)
+# ------------------------------------------------------------
+base_covs     <- c("precipitation","elevation","temperature","CROP_2000","mean_patch_size_ha_2000")
+optional_covs <- c("population_density","slope","accessibility","distance_to_road","income")
+
+present_base     <- base_covs[base_covs %in% names(df)]
+missing_base     <- setdiff(base_covs, present_base)
+if (length(missing_base) > 0) {
+  stop("Missing required covariates: ", paste(missing_base, collapse = ", "))
+}
+
+present_optional <- optional_covs[optional_covs %in% names(df)]
+
+if (length(present_optional) > 0) {
+  optional_combos <- unlist(
+    lapply(1:length(present_optional), function(n) {
+      combn(present_optional, n, simplify = FALSE)
+    }),
+    recursive = FALSE
+  )
+  all_combos <- lapply(optional_combos, function(combo) c(present_base, combo))
+} else {
+  all_combos <- list(present_base)
+}
+
+# Ensure numeric for Mahalanobis
+num_covs_for_maha <- unique(c(present_base, present_optional))
+df <- df %>%
+  dplyr::mutate(
+    dplyr::across(all_of(num_covs_for_maha),
+                  ~ if (is.factor(.x)) as.numeric(.x) else .x)
+  )
+
+# ------------------------------------------------------------
+# 8) Matching (logit, mahalanobis, optional random forest)
+# ------------------------------------------------------------
+methods <- c("logit","mahalanobis")
+if (requireNamespace("ranger", quietly = TRUE)) {
+  methods <- c(methods, "randomforest")
+} else {
+  message("NOTE: 'ranger' not available; skipping randomforest propensity.")
+}
+
+multi_match_results <- list()
+
+for (combo in all_combos) {
+
+  combo_name  <- paste0("combo_", paste(combo, collapse = "--"))
+  cov_formula <- as.formula(paste("TREATMENT ~", paste(combo, collapse = " + ")))
+
+  # Logit PS + caliper
+  if ("logit" %in% methods) {
+    res <- tryCatch(
+      MatchIt::matchit(
+        cov_formula, data = df,
+        method      = "nearest",
+        distance    = "glm",
+        link        = "logit",
+        caliper     = 0.2,
+        std.caliper = TRUE,
+        replace     = FALSE,
+        ratio       = 1
+      ),
+      error = function(e) { message("[", combo_name, "][logit] ", e$message); NULL }
+    )
+    if (!is.null(res) && !is.null(res$match.matrix)) {
+      multi_match_results[[paste0(combo_name, "_logit")]] <- res
+    }
+  }
+
+  # Mahalanobis (no caliper)
+  if ("mahalanobis" %in% methods) {
+    res <- tryCatch(
+      MatchIt::matchit(
+        cov_formula, data = df,
+        method   = "nearest",
+        distance = "mahalanobis",
+        replace  = FALSE,
+        ratio    = 1
+      ),
+      error = function(e) { message("[", combo_name, "][mahalanobis] ", e$message); NULL }
+    )
+    if (!is.null(res) && !is.null(res$match.matrix)) {
+      multi_match_results[[paste0(combo_name, "_mahalanobis")]] <- res
+    }
+  }
+
+  # Random Forest PS (if ranger available)
+  if ("randomforest" %in% methods) {
+    res <- tryCatch({
+      df_rf <- df
+      df_rf$TREATMENT <- factor(df_rf$TREATMENT, levels = c(0,1), labels = c("0","1"))
+
+      rf_fit <- ranger::ranger(
+        formula   = cov_formula,
+        data      = df_rf,
+        probability = TRUE,
+        num.trees = 500,
+        respect.unordered.factors = "order",
+        seed      = 42
+      )
+
+      rf_pred <- predict(rf_fit, data = df_rf)
+      ps_mat  <- rf_pred$predictions
+      if (is.null(dim(ps_mat))) stop("RF predictions did not return class probabilities.")
+
+      col_1 <- if (!is.null(colnames(ps_mat)))
+        which(colnames(ps_mat) %in% c("1","TRUE","treated")) else integer(0)
+      if (length(col_1) == 0) col_1 <- which.max(colMeans(ps_mat, na.rm = TRUE))
+
+      ps_vec <- as.numeric(ps_mat[, col_1])
+      eps <- 1e-6
+      ps_vec[!is.finite(ps_vec)] <- NA_real_
+      if (anyNA(ps_vec)) stop("Random forest produced NA propensities.")
+      ps_vec <- pmin(pmax(ps_vec, eps), 1 - eps)
+
+      MatchIt::matchit(
+        cov_formula, data = df,
+        method   = "nearest",
+        distance = ps_vec,
+        replace  = FALSE,
+        ratio    = 1
+      )
+    }, error = function(e) { message("[", combo_name, "][randomforest] ", e$message); NULL })
+
+    if (!is.null(res) && !is.null(res$match.matrix)) {
+      multi_match_results[[paste0(combo_name, "_randomforest")]] <- res
+    }
+  }
+}
+
+if (length(multi_match_results) == 0L) {
+  stop("All matching attempts failed. Check covariates, treatment variation, or method settings.")
+}
+
+# ------------------------------------------------------------
+# 9) Balance summary
+# ------------------------------------------------------------
+balance_summary <- data.frame()
+
+for (name in names(multi_match_results)) {
+  bal <- tryCatch(cobalt::bal.tab(multi_match_results[[name]], un = TRUE),
+                  error = function(e) NULL)
+  if (is.null(bal) || is.null(bal$Balance)) next
+
+  balance_summary <- rbind(
+    balance_summary,
+    data.frame(
+      Matching_Set    = name,
+      Mean_SMD_Before = mean(abs(bal$Balance$Diff.Un),  na.rm = TRUE),
+      Mean_SMD_After  = mean(abs(bal$Balance$Diff.Adj), na.rm = TRUE),
+      Max_SMD_After   = max(abs(bal$Balance$Diff.Adj),  na.rm = TRUE)
+    )
+  )
+}
+
+# ------------------------------------------------------------
+# 10) OLS with robust SE (HC1), using matching weights
+# ------------------------------------------------------------
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+lm_results <- tibble::tibble(
+  Matching_Set      = character(),
+  n_complete        = integer(),
+  n_treated         = integer(),
+  n_control         = integer(),
+  Estimate          = numeric(),
+  Std_Error         = numeric(),
+  P_value_LM_Robust = numeric()
+)
+
+for (name in names(multi_match_results)) {
+
+  mobj <- multi_match_results[[name]]
+  matched <- tryCatch(MatchIt::match.data(mobj), error = function(e) NULL)
+  if (is.null(matched)) next
+
+  if (!"delta_patch" %in% names(matched) &&
+      all(c("mean_patch_size_ha_2000","mean_patch_size_ha_2022") %in% names(matched))) {
+    matched <- matched %>%
+      dplyr::mutate(delta_patch = mean_patch_size_ha_2022 - mean_patch_size_ha_2000)
+  }
+
+  covariate_str <- gsub("^combo_|_(logit|mahalanobis|randomforest)$", "", name)
+  covariates    <- unlist(strsplit(covariate_str, "--"))
+  covariates    <- covariates[covariates %in% names(matched)]
+
+  needed <- unique(c("delta_patch","TREATMENT", covariates))
+  dfm <- matched[, needed, drop = FALSE]
+  dfm$weights <- matched$weights %||% 1
+
+  dfm <- dfm[stats::complete.cases(dfm), , drop = FALSE]
+
+  n_t <- sum(dfm$TREATMENT == 1L, na.rm = TRUE)
+  n_c <- sum(dfm$TREATMENT == 0L, na.rm = TRUE)
+
+  if (n_t < 2L || n_c < 2L) next
+  if (sd(dfm$delta_patch, na.rm = TRUE) == 0) next
+
+  form <- stats::as.formula(
+    paste(
+      "delta_patch ~ TREATMENT",
+      if (length(covariates)) paste("+", paste(covariates, collapse = " + ")) else ""
+    )
+  )
+
+  model_ct <- tryCatch({
+    fit <- stats::lm(form, data = dfm, weights = dfm$weights)
+    lmtest::coeftest(fit, vcov. = sandwich::vcovHC(fit, type = "HC1"))
+  }, error = function(e) NULL)
+
+  if (is.null(model_ct)) next
+
+  tr_name <- if ("TREATMENT" %in% rownames(model_ct)) "TREATMENT" else
+    grep("^TREATMENT", rownames(model_ct), value = TRUE)[1]
+
+  if (is.na(tr_name) || is.null(tr_name)) next
+
+  tr <- model_ct[tr_name, ]
+
+  lm_results <- dplyr::bind_rows(
+    lm_results,
+    tibble::tibble(
+      Matching_Set      = name,
+      n_complete        = nrow(dfm),
+      n_treated         = n_t,
+      n_control         = n_c,
+      Estimate          = unname(tr["Estimate"]),
+      Std_Error         = unname(tr["Std. Error"]),
+      P_value_LM_Robust = unname(tr["Pr(>|t|)"])
+    )
+  )
+}
+
+if (nrow(lm_results) == 0L) {
+  message("No OLS results produced after feasibility checks.")
+  if (nrow(balance_summary) > 0) {
+    message("Balance summary (where available):")
+    print(balance_summary)
+  }
+  quit(save = "no")
+}
+
+# ------------------------------------------------------------
+# 11) Merge + tag models
+# ------------------------------------------------------------
+summary_table <- lm_results %>%
+  dplyr::mutate(
+    Method     = sub(".*_(logit|mahalanobis|randomforest)$", "\1", Matching_Set),
+    Covariates = gsub("^combo_|_(logit|mahalanobis|randomforest)$", "", Matching_Set)
+  ) %>%
+  dplyr::left_join(balance_summary, by = "Matching_Set") %>%
+  dplyr::mutate(
+    OLS_Significance = P_value_LM_Robust < 0.05,
+    balance_tier = dplyr::case_when(
+      is.na(Mean_SMD_After) ~ "moderate",
+      Mean_SMD_After < 0.10 ~ "good",
+      Mean_SMD_After < 0.30 ~ "moderate",
+      TRUE                  ~ "poor"
+    ),
+    balance_good     = balance_tier == "good",
+    balance_moderate = balance_tier == "moderate",
+    balance_poor     = balance_tier == "poor",
+    Model_ID         = dplyr::row_number()
+  )
+
+# ------------------------------------------------------------
+# 12) Spec grid (with income) — ggplot
+# ------------------------------------------------------------
+grid_data <- summary_table %>%
+  dplyr::mutate(
+    population_density = grepl("population_density", Covariates),
+    slope              = grepl("slope", Covariates),
+    accessibility      = grepl("accessibility", Covariates),
+    distance_to_road   = grepl("distance_to_road", Covariates),
+    income             = grepl("income", Covariates),
+    logit              = Method == "logit",
+    mahalanobis        = Method == "mahalanobis",
+    randomforest       = Method == "randomforest"
+  ) %>%
+  dplyr::select(
+    Model_ID,
+    population_density, slope, accessibility, distance_to_road, income,
+    logit, mahalanobis, randomforest,
+    balance_poor, balance_moderate, balance_good,
+    OLS_Significance
+  )
+
+grid_long <- tidyr::pivot_longer(
+  grid_data,
+  cols = -Model_ID,
+  names_to = "Feature",
+  values_to = "Included"
+) %>%
+  dplyr::mutate(
+    Included = factor(Included, levels = c(TRUE, FALSE))
+  )
+
+grid_long$Feature <- factor(
+  grid_long$Feature,
+  levels = c(
+    "population_density","slope","accessibility","distance_to_road","income",
+    "logit","mahalanobis","randomforest",
+    "balance_poor","balance_moderate","balance_good",
+    "OLS_Significance"
+  )
+)
+
+plot_grid <- ggplot(grid_long, aes(
+  x = factor(Model_ID),
+  y = Feature,
+  color = Included
+)) +
+  geom_point(size = 3, shape = 16) +
+  scale_color_manual(
+    values = c(`TRUE` = "steelblue", `FALSE` = "grey80"),
+    guide = "none"
+  ) +
+  labs(
+    title = "Specification grid — Mean field size (4-km lattice)",
+    x = "Model ID",
+    y = "Attributes"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x  = element_blank(),
+    axis.ticks.x = element_blank()
+  )
+
+print(plot_grid)
+
+# ------------------------------------------------------------
+# 13) Significance-colored s-chart with vertical main-model line
+# ------------------------------------------------------------
+plot_df <- summary_table %>%
+  dplyr::arrange(Estimate) %>%
+  dplyr::transmute(
+    Estimate,
+    SE  = Std_Error,
+    Sig = P_value_LM_Robust < 0.05
+  )
+
+cols <- ifelse(plot_df$Sig, "blue", "grey70")
+
+z   <- qnorm(0.975)
+lwr <- plot_df$Estimate - z * plot_df$SE
+upr <- plot_df$Estimate + z * plot_df$SE
+xs  <- seq_len(nrow(plot_df))
+
+ylim <- range(c(lwr, upr, 0), na.rm = TRUE)
+ylim <- ylim + diff(ylim) * 0.10 * c(-1, 1)
+
+graphics.off()
+par(mar = c(5, 6, 4, 2) + 0.1)
+
+plot(xs, plot_df$Estimate, type = "n", xaxt = "n",
+     xlab = "", ylab = "ATT (Δ mean field size, ha)",
+     ylim = ylim)
+
+abline(h = 0, lty = 2, lwd = 2, col = "grey60")
+
+# Set this to your preferred main ATT (vertical red line)
+main_att <- -0.297
+idx_main <- which.min(abs(plot_df$Estimate - main_att))
+abline(v = idx_main, col = "red3", lwd = 4)
+
+segments(xs, lwr, xs, upr, lwd = 3, col = cols)
+points(xs, plot_df$Estimate,
+       pch = 21, cex = 0.9,
+       lwd = 1.5, col = cols, bg = "white")
+
+box()
+
+# ------------------------------------------------------------
+# 14) Text summary
+# ------------------------------------------------------------
+mean_att_ols <- mean(summary_table$Estimate, na.rm = TRUE)
+sd_att_ols   <- sd(summary_table$Estimate, na.rm = TRUE)
+mean_p_ols   <- mean(summary_table$P_value_LM_Robust, na.rm = TRUE)
+
+cat("
+=== MEAN FIELD SIZE (4-km) : OLS-ONLY SUMMARY ===
+")
+cat(sprintf("Mean ATT (OLS): % .5f
+", mean_att_ols))
+cat(sprintf("Std Dev ATT (OLS): %.5f
+", sd_att_ols))
+cat(sprintf("Mean p-value (OLS): %.5f
+", mean_p_ols))
+
+by_method <- summary_table %>%
+  dplyr::group_by(Method) %>%
+  dplyr::summarise(
+    n_models     = dplyr::n(),
+    n_sig_ols    = sum(OLS_Significance, na.rm = TRUE),
+    mean_att_ols = mean(Estimate, na.rm = TRUE),
+    sd_att_ols   = sd(Estimate, na.rm = TRUE),
+    mean_p_ols   = mean(P_value_LM_Robust, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(Method)
+
+cat("
+=== BY METHOD (OLS only) ===
+")
+print(by_method)
+
+n_models_total <- nrow(summary_table)
+n_with_est     <- sum(is.finite(summary_table$Estimate))
+n_sig_models   <- sum(summary_table$P_value_LM_Robust < 0.05, na.rm = TRUE)
+n_neg_models   <- sum(summary_table$Estimate < 0, na.rm = TRUE)
+
+cat("
+=== OVERALL SUMMARY (OLS) ===
+")
+cat(sprintf("Models (total): %d
+", n_models_total))
+cat(sprintf("Models with estimate: %d
+", n_with_est))
+cat(sprintf("Significant models (p<0.05): %d (%.1f%%)
+",
+            n_sig_models, 100 * n_sig_models / max(1, n_models_total)))
+cat(sprintf("Models with ATT < 0: %d (%.1f%%)
+",
+            n_neg_models, 100 * n_neg_models / max(1, n_models_total)))
+cat(sprintf("Mean ATT across models: % .5f
+", mean_att_ols))
+
+by_method_counts <- summary_table %>%
+  dplyr::group_by(Method) %>%
+  dplyr::summarise(
+    n_models   = dplyr::n(),
+    n_sig      = sum(P_value_LM_Robust < 0.05, na.rm = TRUE),
+    n_negative = sum(Estimate < 0, na.rm = TRUE),
+    mean_ATT   = mean(Estimate, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(Method)
+
+cat("
+=== BY METHOD: counts & mean ATT ===
+")
+print(by_method_counts)
+
+cat("
+✅ 4-km spec grid pipeline completed.
+")
