@@ -1,0 +1,780 @@
+# ==============================================================
+# Script name: 11_GPP_mean_permutations.R
+# Project:     ABDZs_impact
+#
+# Purpose:
+#   Fixed-window specification curve for mean GPP changes.
+#
+#   - STRICT full coverage for:
+#         Early window: 2001–2003
+#         Late  window: 2019–2021
+#   - Apply OUTER 10-km buffer filter
+#   - 2-km thinning (one pixel per supercell)
+#   - Matching permutations:
+#         * Nearest neighbor, logit PS (caliper 0.2 SD)
+#         * Nearest neighbor, random forest PS (caliper 0.2 SD) if ranger available
+#   - For each spec: OLS with HC1 robust SEs using matching weights
+#   - Outputs:
+#         * Specification curve with main-effect line
+#         * Balance-only grid
+#         * Full spec grid (methods, covariates, balance, significance)
+#         * Base-R CI chart (schart-style)
+#
+# Outcome:
+#   Δ GPP mean = mean(2019–2021) − mean(2001–2003)
+#
+# Notes:
+#   - No install.packages calls.
+#   - Assumes inputs:
+#         GPP_exports/GPP_ALL_WITH_COVARIATES.shp
+#         OUTER_BUFFER_10km.shp
+# ==============================================================
+
+suppressPackageStartupMessages({
+  library(sf)
+  library(dplyr)
+  library(MatchIt)
+  library(cobalt)
+  library(sandwich)
+  library(lmtest)
+  library(tidyr)
+  library(ggplot2)
+  library(stringr)
+  library(purrr)
+})
+
+set.seed(42)
+
+# ------------------------------
+# 0) Paths, CRS, main-effect to highlight on spec curve
+# ------------------------------
+in_shp            <- "GPP_exports/GPP_ALL_WITH_COVARIATES.shp"
+outer_buffer_path <- "OUTER_BUFFER_10km.shp"
+epsg_utm          <- 32718
+
+# Main-model estimate to highlight in spec curve (adjust as needed)
+main_effect       <- 0.046
+
+# Fixed window definition
+time_windows <- list(
+  list(name = "3yr_mean", early = 2001:2003, late = 2019:2021)
+)
+
+# ------------------------------
+# 1) Load, project, rename common covariates
+# ------------------------------
+x <- sf::st_read(in_shp, quiet = TRUE)
+if (isTRUE(sf::st_is_longlat(x))) {
+  x <- sf::st_transform(x, epsg_utm)
+}
+
+rename_if_present <- function(df, from, to) {
+  if (from %in% names(df)) dplyr::rename(df, !!to := .data[[from]]) else df
+}
+
+x <- x %>%
+  rename_if_present("ACCESSIBIL", "accessibility") %>%
+  rename_if_present("ELEVATIONM", "elevation") %>%
+  rename_if_present("SLOPEMEAN",  "slope") %>%
+  rename_if_present("PRECIPITAT", "precipitation") %>%
+  rename_if_present("TEMP_MEAN",  "temperature") %>%
+  rename_if_present("POPDENS_ME","population_density") %>%
+  rename_if_present("ing_pc_",    "INCOME") %>%
+  rename_if_present("Hub_distan", "distance_to_road") %>%
+  rename_if_present("AGRICULTUR", "CROP_2000")
+
+# Coerce TREATMENT to strict 0/1
+to_int01 <- function(x){
+  if (is.factor(x)) x <- as.character(x)
+  if (is.character(x)) {
+    xl <- tolower(trimws(x))
+    x <- ifelse(
+      xl %in% c("1","true","t","yes","y","treated","treatment"),
+      1L,
+      ifelse(xl %in% c("0","false","f","no","n","control"), 0L, NA_integer_)
+    )
+  }
+  if (is.logical(x)) x <- as.integer(x)
+  if (is.numeric(x)) x <- as.integer(x != 0 & !is.na(x))
+  as.integer(x)
+}
+
+stopifnot("TREATMENT" %in% names(x))
+x$TREATMENT <- to_int01(x$TREATMENT)
+
+# ------------------------------
+# 2) Normalize GPP column names + force numeric
+#    Accepts patterns like gppYYYY, gpp_YYYY, etc.
+# ------------------------------
+norm_idx <- grep("(?i)^gpp[^0-9]*\d{4}$", names(x), perl = TRUE)
+if (length(norm_idx)) {
+  new_names <- toupper(gsub("(?i)^gpp[^0-9]*(\d{4})$", "GPP_\1", names(x)[norm_idx], perl = TRUE))
+  names(x)[norm_idx] <- new_names
+}
+
+x <- x %>%
+  mutate(across(matches("^GPP_\d{4}$"), ~ suppressWarnings(as.numeric(.))))
+
+# ------------------------------
+# 3) Remove cells intersecting OUTER_BUFFER_10km
+# ------------------------------
+outer10 <- sf::st_read(outer_buffer_path, quiet = TRUE) |>
+  sf::st_transform(epsg_utm) |>
+  sf::st_make_valid()
+outer10_u <- sf::st_union(outer10)
+
+n0 <- nrow(x)
+x  <- x[lengths(sf::st_intersects(x, outer10_u)) == 0L, ]
+message(
+  "Removed ", n0 - nrow(x),
+  " cells intersecting OUTER_BUFFER_10km; kept ", nrow(x), "."
+)
+
+# ------------------------------
+# 4) 2-km thinning (one per supercell)
+# ------------------------------
+cent <- sf::st_centroid(x)
+xy   <- sf::st_coordinates(cent)
+
+x <- x %>%
+  mutate(
+    x_coord = xy[,1],
+    y_coord = xy[,2],
+    super_x = floor(x_coord / 2000),
+    super_y = floor(y_coord / 2000)
+  ) %>%
+  group_by(super_x, super_y) %>%
+  slice(1) %>%
+  ungroup()
+
+# ------------------------------
+# 5) Helpers + covariates
+# ------------------------------
+df_all <- sf::st_drop_geometry(x)
+
+find_gpp_cols <- function(df, years) {
+  want  <- paste0("GPP_", years)
+  have  <- names(df)
+  found <- want[want %in% have]
+  list(found = found, missing = setdiff(want, found))
+}
+
+# Core covariates always included
+always_covs   <- c("precipitation","elevation","population_density")
+# Optional covariates (permuted)
+optional_covs <- c("temperature","slope","accessibility","INCOME","distance_to_road")
+
+always_covs   <- intersect(always_covs,   names(df_all))
+optional_covs <- intersect(optional_covs, names(df_all))
+
+# All optional combinations (including empty set)
+optional_combos <- c(
+  list(character(0)),
+  unlist(
+    lapply(seq_along(optional_covs), function(n)
+      combn(optional_covs, n, simplify = FALSE)),
+    recursive = FALSE
+  )
+)
+
+combo_key   <- function(x) paste(sort(x), collapse = "|")
+all_combos0 <- unique(optional_combos)
+names(all_combos0) <- vapply(all_combos0, combo_key, "")
+
+# Matching methods: logit + randomforest (if available)
+methods <- c("logit", "randomforest")
+if (!requireNamespace("ranger", quietly = TRUE)) {
+  methods <- c("logit")
+  message("NOTE: 'ranger' not available; skipping randomforest propensity.")
+}
+
+# ------------------------------
+# 6) STRICT coverage, matching, OLS(HC1)
+#     Outcome = Δ GPP mean (late - early)
+# ------------------------------
+all_results <- list()
+
+for (tw in time_windows) {
+  tw_name <- tw$name
+
+  chk_early <- find_gpp_cols(df_all, tw$early)
+  chk_late  <- find_gpp_cols(df_all, tw$late)
+
+  if (length(chk_early$missing) || length(chk_late$missing)) {
+    stop(sprintf(
+      "[Window %s] Missing required GPP columns.\n  Missing early: %s\n  Missing late:  %s",
+      tw_name,
+      ifelse(length(chk_early$missing), paste(chk_early$missing, collapse = ", "), "none"),
+      ifelse(length(chk_late$missing),  paste(chk_late$missing,  collapse = ", "), "none")
+    ))
+  }
+
+  early_cols <- chk_early$found
+  late_cols  <- chk_late$found
+
+  M_early <- as.matrix(df_all[, early_cols, drop = FALSE])
+  M_late  <- as.matrix(df_all[, late_cols,  drop = FALSE])
+
+  keep_complete <- rowSums(is.na(M_early)) == 0 & rowSums(is.na(M_late)) == 0
+  keep_trt      <- df_all$TREATMENT %in% c(0L, 1L)
+  keep          <- keep_complete & keep_trt
+
+  message(sprintf(
+    "[Window %s] %d/%d units have full observations in BOTH windows.",
+    tw_name, sum(keep), nrow(df_all)
+  ))
+
+  df_tw   <- df_all[keep, , drop = FALSE]
+  M_early <- M_early[keep, , drop = FALSE]
+  M_late  <- M_late[keep,  , drop = FALSE]
+
+  mean_early  <- rowMeans(M_early)
+  mean_late   <- rowMeans(M_late)
+  mean_change <- mean_late - mean_early
+
+  ok <- is.finite(mean_change)
+  df_tw <- df_tw[ok, , drop = FALSE]
+  df_tw$mean_change <- mean_change[ok]
+
+  message(sprintf(
+    "[Window %s] Kept %d rows after strict coverage and finite check.",
+    tw_name, nrow(df_tw)
+  ))
+  if (nrow(df_tw) < 10) {
+    message("[Window ", tw_name, "] Too few rows; skipping.")
+    next
+  }
+
+  match_results  <- list()
+  lm_results     <- tibble()
+  balance_labels <- tibble()
+
+  # Build covariate sets for this window
+  combos_this <- lapply(all_combos0, function(opt)
+    unique(c(always_covs, opt)))
+  combos_this <- lapply(combos_this, function(v)
+    intersect(v, names(df_tw)))
+  combos_this <- combos_this[lengths(combos_this) > 0]
+
+  for (combo in combos_this) {
+    combo_name  <- paste0("combo_", paste(combo, collapse = "--"))
+    cov_formula <- as.formula(paste("TREATMENT ~", paste(combo, collapse = " + ")))
+
+    for (method in methods) {
+      result_name <- paste0(combo_name, "_", method, "_", tw_name)
+
+      # MatchIt call (logit/randomforest with 0.2 SD caliper)
+      mobj <- tryCatch(
+        matchit(
+          cov_formula,
+          data        = df_tw,
+          method      = "nearest",
+          distance    = method,
+          caliper     = ifelse(method %in% c("logit","randomforest"), 0.2, NA),
+          std.caliper = ifelse(method %in% c("logit","randomforest"), TRUE, FALSE),
+          replace     = FALSE,
+          ratio       = 1
+        ),
+        error = function(e) {
+          message("  [", result_name, "] matchit error: ", conditionMessage(e))
+          NULL
+        }
+      )
+      if (is.null(mobj)) next
+
+      match_results[[result_name]] <- mobj
+
+      # Extract matched data with weights
+      matched <- tryCatch(MatchIt::match.data(mobj), error = function(e) NULL)
+      if (is.null(matched)) next
+
+      if (!"mean_change" %in% names(matched)) {
+        matched <- dplyr::left_join(matched,
+                                    df_tw %>% dplyr::select(mean_change),
+                                    by = character())
+      }
+
+      nt   <- sum(matched$TREATMENT == 1, na.rm = TRUE)
+      nc   <- sum(matched$TREATMENT == 0, na.rm = TRUE)
+      sd_y <- sd(matched$mean_change, na.rm = TRUE)
+      message(sprintf(
+        "  [%s] matched N=%d (T=%d, C=%d); sd(Δmean)=%.4g",
+        result_name, nrow(matched), nt, nc, sd_y
+      ))
+      if (length(unique(matched$TREATMENT)) < 2 || sd_y == 0) next
+
+      # Balance summary
+      bal <- tryCatch(cobalt::bal.tab(mobj, un = FALSE), error = function(e) NULL)
+      if (!is.null(bal) && !is.null(bal$Balance)) {
+        btab <- bal$Balance
+        smd_col <- intersect(
+          colnames(btab),
+          c("Std.Diff.Adj","Std.Diff.Adj.","M.Diff.Adj","Diff.Adj")
+        )
+        max_smd <- if (length(smd_col)) {
+          suppressWarnings(max(abs(btab[[smd_col[1]]]), na.rm = TRUE))
+        } else NA_real_
+        max_smd <- ifelse(is.finite(max_smd), max_smd, NA_real_)
+        b_label <- dplyr::case_when(
+          !is.na(max_smd) & max_smd < 0.05 ~ "balance_moderate",
+          !is.na(max_smd) & max_smd < 0.10 ~ "balance_good",
+          !is.na(max_smd)                  ~ "balance_poor",
+          TRUE                             ~ "unknown"
+        )
+        balance_labels <- dplyr::bind_rows(
+          balance_labels,
+          tibble(
+            Matching_Set = result_name,
+            Balance_Label = b_label,
+            Max_Post_SMD = max_smd
+          )
+        )
+      }
+
+      # OLS with HC1 robust SEs
+      full_formula <- as.formula(
+        paste("mean_change ~ TREATMENT +", paste(combo, collapse = " + "))
+      )
+      rob <- tryCatch({
+        fit <- lm(full_formula, data = matched, weights = weights)
+        lmtest::coeftest(fit, vcov. = sandwich::vcovHC(fit, type = "HC1"))
+      }, error = function(e) {
+        message("  [", result_name, "] OLS error: ", conditionMessage(e))
+        NULL
+      })
+
+      if (!is.null(rob) && "TREATMENT" %in% rownames(rob)) {
+        tr <- rob["TREATMENT", ]
+        lm_results <- dplyr::bind_rows(
+          lm_results,
+          tibble(
+            Matching_Set      = result_name,
+            Estimate          = as.numeric(tr["Estimate"]),
+            Std_Error         = as.numeric(tr["Std. Error"]),
+            P_value_LM_Robust = as.numeric(tr["Pr(>|t|)"])
+          )
+        )
+      }
+    }
+  }
+
+  n_succeeded <- nrow(lm_results)
+  n_signif    <- sum(
+    !is.na(lm_results$P_value_LM_Robust) &
+      lm_results$P_value_LM_Robust < 0.05
+  )
+  message(sprintf(
+    "[Window %s] Successful OLS models: %s; Significant (p<0.05): %s",
+    tw_name, n_succeeded, n_signif
+  ))
+
+  all_results[[tw_name]] <- list(
+    match_results  = match_results,
+    lm_results     = lm_results,
+    balance_labels = balance_labels
+  )
+}
+
+# ------------------------------
+# 7) Combine results & counts
+# ------------------------------
+combined_lm <- dplyr::bind_rows(lapply(names(all_results), function(nm) {
+  ar <- all_results[[nm]]$lm_results
+  if (!is.null(ar) && nrow(ar) > 0) dplyr::mutate(ar, Time_Window = nm)
+})) %>% as_tibble()
+
+combined_bal <- dplyr::bind_rows(lapply(names(all_results), function(nm) {
+  ab <- all_results[[nm]]$balance_labels
+  if (!is.null(ab) && nrow(ab) > 0) dplyr::mutate(ab, Time_Window = nm)
+})) %>% as_tibble()
+
+if (is.null(combined_lm) || nrow(combined_lm) == 0) {
+  stop("No OLS results were produced. Check coverage/matching logs above.")
+}
+
+overall_n_models <- nrow(combined_lm)
+overall_n_sig    <- sum(combined_lm$P_value_LM_Robust < 0.05, na.rm = TRUE)
+message(sprintf(
+  "TOTAL successful OLS models: %s; Significant (p<0.05): %s (%.1f%%)",
+  overall_n_models, overall_n_sig,
+  100 * overall_n_sig / max(1, overall_n_models)
+))
+
+# Flatten MatchIt objects for downstream summaries
+multi_match_results <- purrr::flatten(
+  lapply(all_results, function(x) x$match_results)
+)
+
+# OLS results in spec-grid-friendly format
+ols_results <- combined_lm %>%
+  transmute(
+    Matching_Set,
+    Outcome  = "Δ GPP mean",
+    Estimate,
+    Std_Error,
+    P_value = P_value_LM_Robust
+  )
+
+# ------------------------------
+# 8) Clean merge (Matching_Set + Time_Window)
+# ------------------------------
+models <- combined_lm %>%
+  mutate(
+    Matching_Set = as.character(Matching_Set),
+    Time_Window  = as.character(Time_Window)
+  ) %>%
+  left_join(
+    combined_bal %>%
+      mutate(
+        Matching_Set = as.character(Matching_Set),
+        Time_Window  = as.character(Time_Window)
+      ) %>%
+      select(Matching_Set, Time_Window, Balance_Label, Max_Post_SMD),
+    by = c("Matching_Set","Time_Window")
+  ) %>%
+  mutate(Balance_Label = tidyr::replace_na(Balance_Label, "unknown")) %>%
+  distinct(Matching_Set, Time_Window, .keep_all = TRUE)
+
+# ------------------------------
+# 9) Spec curve (Δ GPP mean) with main-effect line
+# ------------------------------
+spec_curve <- models %>%
+  arrange(Estimate) %>%
+  mutate(
+    Model_ID = row_number(),
+    SigFlag  = ifelse(P_value_LM_Robust < 0.05, "Significant", "Not Significant")
+  )
+
+idx_main <- which.min(abs(spec_curve$Estimate - main_effect))
+
+p_spec <- ggplot(spec_curve,
+                 aes(x = factor(Model_ID), y = Estimate, fill = SigFlag)) +
+  geom_col(width = 0.9) +
+  geom_hline(yintercept = 0, linetype = 2, color = "black", linewidth = 0.3) +
+  geom_vline(xintercept = idx_main, linetype = "dashed",
+             color = "red", linewidth = 0.7) +
+  annotate(
+    "text",
+    x = idx_main,
+    y = max(spec_curve$Estimate, na.rm = TRUE),
+    label = paste0(" main model ~ ", format(main_effect, digits = 3)),
+    hjust = -0.1, vjust = 1.2,
+    color = "red", size = 3.3
+  ) +
+  scale_fill_manual(
+    values = c("Significant" = "steelblue", "Not Significant" = "grey80")
+  ) +
+  labs(
+    title = "OLS Treatment Effects across matching permutations",
+    x = "Model ID (sorted by estimate)",
+    y = "OLS Estimate (Δ GPP mean: 2019–2021 minus 2001–2003)",
+    fill = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+
+print(p_spec)
+
+# ------------------------------
+# 10) Balance-only grid
+# ------------------------------
+bal_levels <- c("balance_good", "balance_moderate", "balance_poor", "unknown")
+models$Balance_Label <- factor(models$Balance_Label, levels = bal_levels)
+
+models_w <- models %>%
+  group_by(Time_Window) %>%
+  arrange(P_value_LM_Robust, .by_group = TRUE) %>%
+  mutate(Model_ID = dplyr::row_number()) %>%
+  ungroup()
+
+p_balance <- ggplot(models_w,
+                    aes(x = factor(Model_ID),
+                        y = Balance_Label,
+                        color = P_value_LM_Robust < 0.05)) +
+  geom_point(size = 2.6) +
+  scale_color_manual(
+    values = c(`TRUE` = "steelblue", `FALSE` = "grey70"),
+    name = "OLS p < 0.05"
+  ) +
+  facet_wrap(~ Time_Window, scales = "free_x") +
+  labs(
+    title = "Balance quality per specification",
+    x = "Model (ordered by OLS p-value within window)",
+    y = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+
+print(p_balance)
+
+# ------------------------------
+# 11) Full spec grid (methods / covariates / balance / significance)
+# ------------------------------
+balance_summary <- {
+  out <- data.frame()
+  for (name in names(multi_match_results)) {
+    bal <- tryCatch(cobalt::bal.tab(multi_match_results[[name]], un = TRUE),
+                    error = function(e) NULL)
+    if (is.null(bal) || is.null(bal$Balance)) next
+    B <- bal$Balance
+    col_un  <- intersect(colnames(B), c("Diff.Un","M.Diff.Un","Std.Diff.Un"))
+    col_adj <- intersect(colnames(B), c("Diff.Adj","M.Diff.Adj","Std.Diff.Adj"))
+    if (!length(col_un))  col_un  <- colnames(B)[1]
+    if (!length(col_adj)) col_adj <- colnames(B)[1]
+    out <- rbind(
+      out,
+      data.frame(
+        Matching_Set    = name,
+        Mean_SMD_Before = mean(abs(B[[col_un[1]]]),  na.rm = TRUE),
+        Mean_SMD_After  = mean(abs(B[[col_adj[1]]]), na.rm = TRUE),
+        Max_SMD_After   = max(abs(B[[col_adj[1]]]),  na.rm = TRUE)
+      )
+    )
+  }
+  out
+}
+
+.pick_pcol <- function(df) {
+  candidates <- c("P_value_LM_Robust","P_value","p_value","pval","p")
+  hit <- intersect(candidates, names(df))
+  if (length(hit)) hit[1] else stop("No p-value column found.")
+}
+
+.method_from_ms <- function(ms) {
+  out <- tolower(sub(".*_((?:logit|randomforest))_\d+yr.*$", "\1", ms, perl = TRUE))
+  bad <- !out %in% c("logit","randomforest")
+  if (any(bad)) {
+    out[bad] <- tolower(stringr::str_extract(
+      ms[bad], "(?<=_)logit(?=_)|(?<=_)randomforest(?=_)"
+    ))
+  }
+  out
+}
+
+.covariates_from_ms <- function(ms) {
+  gsub("^combo_|_(logit|randomforest)_\d+yr.*$", "", ms, perl = TRUE)
+}
+
+make_spec_grid_gpp_mean <- function(ols_results, outcome_label = NULL) {
+  pcol <- .pick_pcol(ols_results)
+  df0 <- if (is.null(outcome_label)) {
+    ols_results
+  } else {
+    ols_results %>% dplyr::filter(Outcome == outcome_label)
+  }
+  if (nrow(df0) == 0) stop("No rows in ols_results for the requested outcome.")
+
+  Method     <- .method_from_ms(df0$Matching_Set)
+  Covariates <- .covariates_from_ms(df0$Matching_Set)
+
+  df <- df0 %>%
+    dplyr::mutate(
+      Method           = Method,
+      Covariates       = Covariates,
+      OLS_Significance = .data[[pcol]] < 0.05
+    ) %>%
+    dplyr::left_join(balance_summary, by = "Matching_Set") %>%
+    dplyr::mutate(
+      balance_tier = dplyr::case_when(
+        is.na(Mean_SMD_After) ~ "moderate",
+        Mean_SMD_After < 0.10 ~ "very_good",
+        Mean_SMD_After < 0.30 ~ "moderate",
+        TRUE                  ~ "poor"
+      ),
+      balance_very_good = balance_tier == "very_good",
+      balance_moderate  = balance_tier == "moderate",
+      balance_poor      = balance_tier == "poor",
+      Model_ID          = dplyr::row_number()
+    )
+
+  feature_flags <- c("temperature","slope","accessibility","INCOME","distance_to_road")
+
+  spec <- df %>%
+    dplyr::mutate(
+      temperature      = grepl("(^|--)temperature($|--)", Covariates),
+      slope            = grepl("(^|--)slope($|--)", Covariates),
+      accessibility    = grepl("(^|--)accessibility($|--)", Covariates),
+      INCOME           = grepl("(^|--)INCOME($|--)", Covariates),
+      distance_to_road = grepl("(^|--)distance_to_road($|--)", Covariates),
+      logit            = Method == "logit",
+      randomforest     = Method == "randomforest"
+    ) %>%
+    dplyr::select(
+      Model_ID,
+      dplyr::all_of(feature_flags),
+      logit, randomforest,
+      balance_poor, balance_moderate, balance_very_good,
+      OLS_Significance
+    )
+
+  grid_long <- tidyr::pivot_longer(
+    spec, cols = -Model_ID,
+    names_to = "Feature",
+    values_to = "Included"
+  ) %>%
+    dplyr::mutate(
+      Included = factor(Included, levels = c(TRUE, FALSE))
+    )
+
+  grid_long$Feature <- factor(
+    grid_long$Feature,
+    levels = c(
+      "temperature","slope","accessibility","INCOME","distance_to_road",
+      "logit","randomforest",
+      "balance_poor","balance_moderate","balance_very_good",
+      "OLS_Significance"
+    )
+  )
+
+  cat("\n[Method counts for Δ GPP mean]\n")
+  print(table(df$Method, useNA = "ifany"))
+
+  list(grid_long = grid_long, model_df = df)
+}
+
+plot_spec_grid <- function(grid_long, title_txt) {
+  ggplot(grid_long, aes(x = factor(Model_ID), y = Feature, color = Included)) +
+    geom_point(size = 3, shape = 16) +
+    scale_color_manual(values = c(`TRUE` = "steelblue", `FALSE` = "grey80"),
+                       guide = "none") +
+    labs(
+      title = title_txt,
+      x = "Model ID",
+      y = "Attributes"
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(axis.text.x = element_blank(),
+          axis.ticks.x = element_blank())
+}
+
+g_gpp <- make_spec_grid_gpp_mean(ols_results)
+plot_grid_gpp <- plot_spec_grid(g_gpp$grid_long, "Specification grid — Δ GPP mean")
+print(plot_grid_gpp)
+
+# ------------------------------
+# 12) Quick counts / summary
+# ------------------------------
+cat("\n=== Quick counts ===\n")
+cat("Total successful OLS models:", nrow(models), "\n")
+cat("Significant (p<0.05):",
+    sum(models$P_value_LM_Robust < 0.05, na.rm = TRUE), "\n\n")
+
+models %>%
+  count(Time_Window, Balance_Label) %>%
+  group_by(Time_Window) %>%
+  mutate(share = round(100 * n / sum(n), 1)) %>%
+  arrange(Time_Window, Balance_Label) %>%
+  print(n = Inf)
+
+# ------------------------------
+# 13) Base-R spec chart (CI bars + hollow circles)
+# ------------------------------
+if (!exists("schart")) {
+  schart <- function(data, index.est=1, index.se=2, order="asis", ci=.95,
+                     ylim=NA, axes=TRUE, heights=c(1,1), leftmargin=11,
+                     ylab="Coefficient", lwd.border=1, lwd.est=4,
+                     pch.est=21, lwd.symbol=2, ref=0, lwd.ref=1,
+                     lty.ref=2, col.ref="black",
+                     col.est=c("grey60","red3","blue"),
+                     bg.est=c("white","white")) {
+    d <- data
+    rownames(d) <- 1:nrow(d)
+    if (order == "asis")       o <- 1:nrow(d)
+    if (order == "increasing") o <- order(d[, index.est])
+    if (order == "decreasing") o <- order(-d[, index.est])
+    d   <- d[o, , drop = FALSE]
+    est <- d[, index.est]
+    se  <- d[, index.se]
+    a   <- qnorm(1 - (1 - ci) / 2)
+    l1  <- est - a * se
+    h1  <- est + a * se
+    xs  <- 1:nrow(d)
+    if (is.na(ylim[1]) || length(ylim) != 2) {
+      ylim <- range(c(l1, h1, ref))
+      ylim <- ylim + diff(ylim) / 10 * c(-1, 1)
+    }
+    par(mar = c(3, leftmargin, 1.5, 1))
+    plot(est, xlab = "", ylab = "", axes = FALSE,
+         type = "n", ylim = ylim, xlim = range(xs))
+    abline(h = ref, lty = lty.ref, lwd = lwd.ref, col = col.ref)
+    arrows(xs, l1, xs, h1, length = 0, code = 3,
+           lwd = lwd.est, col = col.est[1], angle = 90)
+    points(xs, est, pch = pch.est, lwd = lwd.symbol,
+           col = col.est[1], bg = bg.est[1])
+    if (axes) {
+      axis(2, las = 2, cex.axis = 1, lwd = lwd.border)
+      axis(4, labels = NA, lwd = lwd.border)
+    }
+    box(lwd = lwd.border)
+  }
+}
+
+stopifnot(exists("models"), exists("main_effect"))
+
+ols_input <- models %>%
+  dplyr::filter(is.finite(Estimate), is.finite(Std_Error)) %>%
+  dplyr::arrange(Estimate) %>%
+  dplyr::mutate(
+    MainModel   = abs(Estimate - main_effect) ==
+      min(abs(Estimate - main_effect), na.rm = TRUE),
+    Significant = P_value_LM_Robust < 0.05
+  )
+
+if (nrow(ols_input) == 0) {
+  stop("No rows available for schart().")
+}
+
+ols_schart <- data.frame(
+  Estimate    = ols_input$Estimate,
+  SE          = ols_input$Std_Error,
+  Significant = ols_input$Significant,
+  MainModel   = ols_input$MainModel
+)
+
+graphics.off()
+par(mar = c(3, 6, 1.5, 1))
+schart(
+  data       = ols_schart,
+  index.est  = 1,
+  index.se   = 2,
+  order      = "asis",
+  ref        = 0,
+  ci         = 0.95,
+  lwd.est    = 2,
+  pch.est    = 21,
+  lwd.symbol = 1.5,
+  col.est    = c("grey60","red3","blue3"),
+  bg.est     = c("white","white"),
+  col.ref    = "black",
+  lty.ref    = 2,
+  leftmargin = 6
+)
+
+idx_main <- which(ols_schart$MainModel)
+if (length(idx_main) == 1) {
+  abline(v = idx_main, col = "red3", lwd = 4)
+}
+mtext("ATT", side = 2, line = 3.8, cex = 0.95)
+
+# -------- Summary block --------
+expected_sign <- -1
+
+n_total        <- nrow(models)
+n_sig          <- sum(models$P_value_LM_Robust < 0.05, na.rm = TRUE)
+n_sig_expected <- sum(
+  models$P_value_LM_Robust < 0.05 &
+    sign(models$Estimate) == sign(expected_sign),
+  na.rm = TRUE
+)
+share_sig <- round(100 * n_sig / max(1, n_total), 1)
+est_range <- range(models$Estimate, na.rm = TRUE)
+
+cat("\n=== Summary ===\n")
+cat("Total models:", n_total, "\n")
+cat("Significant (p<0.05):", n_sig,
+    sprintf("(%.1f%%%%)", share_sig), "\n")
+cat("Significant with expected sign (", expected_sign, "): ",
+    n_sig_expected, "\n", sep = "")
+cat("Estimate range:", sprintf("[%.4f, %.4f]", est_range[1], est_range[2]), "\n")
