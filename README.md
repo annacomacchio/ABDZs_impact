@@ -22,16 +22,17 @@ These files are sufficient to reproduce all analyses in this repo.
     - Unique cell identifier (`ID`)
     - Treatment indicator (`TREATMENT`)
     - Land-cover summaries
-    - GPP-based metrics (where used)
     - Environmental covariates used for matching:
       - precipitation, temperature, elevation, slope  
       - distance to road, accessibility
       - population density, income  
       - baseline land cover / agriculture shares
 
-This is the **input** for all land-use matching scripts.
+This is the **input** for all land-use matching scripts and permutation/specification-curve scripts below.
 
-
+- 'GPP_ALL_WITH_COVARIATES_part1.zip'+'GPP_ALL_WITH_COVARIATES_part2.zip'
+  - same as above +
+    - GPP-based metrics for each year 2001-2021
 
 #### Matched datasets
 
@@ -49,7 +50,7 @@ Each zip contains the shapefile(s)/CSV(s) corresponding to the final matched sam
 - `Mean_field_size_matched_dataset.zip`
   - Matched samples for mean field size (MFS) analyses (4-km lattice etc.).
 
-These matched datasets are the **exact inputs** consumed by the analysis and permutation/specification-curve scripts below.
+These matched datasets are the **exact inputs** consumed by the analysis. 
 
 ---
 
@@ -162,6 +163,24 @@ These steps will reproduce the covariates and outcomes that are already bundled 
 - `COVARIATES_ALL_NO_COTAHUASI.*` (pre-matching grid for land use outcomes), 
 
 ---
+
+
+- `PCA.R`  
+  Code and outputs for PCA of environmental covariates (used for descriptive analysis; underlying raw rasters not included here).  
+  The script expects the following **input layers**, which are **not** bundled in this repository:
+
+  - Environmental rasters (1 km):
+    - `PCA/processed/bio2_1km.tif` (temperature)
+    - `PCA/processed/bio12_1km.tif` (precipitation)
+    - `PCA/processed/radiation_1km.tif` (solar radiation)
+    - `PCA/processed/elevation_1km.tif` (elevation)
+    - `PCA/processed/slope_1km.tif` (slope)
+    - `PCA/processed/swb_1km.tif` (soil water balance)
+    - `PCA/processed/humidity_1km.tif` (humidity)
+    - `PCA/processed/gsl_1km.tif` (growing season length)
+
+  These layers are omitted due to size/licensing constraints but can be reconstructed from the CHELSA products (CHELSA climatologies & bioclim variables: https://chelsa-climate.org/datasets/chelsa_climatologies and https://chelsa-climate.org/datasets/chelsa_bioclim), except for slope and elevation 
+
 
 ## 6. Contact
 
